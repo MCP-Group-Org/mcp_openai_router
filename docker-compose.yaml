@@ -1,0 +1,18 @@
+services:
+  mcp-server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: mcp-server
+    restart: unless-stopped
+    env_file:
+      - .env
+    ports:
+      - "8080:8000" # внешний 8080 → внутренний 8000
+    volumes:
+      - ./:/app:rw
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
