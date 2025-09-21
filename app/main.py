@@ -1,37 +1,47 @@
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI
 from pydantic import BaseModel
-from pathlib import Path
+from typing import Any, Optional, Dict, Literal
 
-app = FastAPI(title="MCP Server")
+# --- Инициализация приложения ---
+app = FastAPI(title="MCP Server", version="0.1.0")
 
+# --- Healthcheck ---
 @app.get("/health")
-def health():
+async def health():
     return {"status": "ok"}
 
-# ---- TOOLS (dev stubs) ----
-class EchoIn(BaseModel):
-    text: str
-    upper: bool = False
+# --- JSON-RPC 2.0 модели (pydantic v2-совместимые) ---
+class JsonRpcRequest(BaseModel):
+    jsonrpc: Literal["2.0"] = "2.0"
+    method: str
+    params: Optional[Dict[str, Any]] = None
+    id: Optional[Any] = None
 
-class EchoOut(BaseModel):
-    value: str
-    length: int
+class JsonRpcResponse(BaseModel):
+    jsonrpc: Literal["2.0"] = "2.0"
+    result: Any = None
+    id: Optional[Any] = None
 
-@app.post("/tools/echo", response_model=EchoOut)
-def tool_echo(body: EchoIn):
-    val = body.text.upper() if body.upper else body.text
-    return EchoOut(value=val, length=len(val))
+class JsonRpcErrorObj(BaseModel):
+    code: int
+    message: str
+    data: Optional[Any] = None
 
-@app.get("/tools/read_file")
-def tool_read_file(
-    path: str = Query(..., description="Относительный путь внутри /app, напр. README.md"),
-    max_chars: int = Query(2000, ge=1, le=200000)
-):
-    base = Path("/app").resolve()
-    target = (base / path).resolve()
-    if not str(target).startswith(str(base)):
-        raise HTTPException(status_code=400, detail="path escapes /app")
-    if not target.exists() or not target.is_file():
-        raise HTTPException(status_code=404, detail="file not found")
-    text = target.read_text(encoding="utf-8", errors="replace")[:max_chars]
-    return {"path": str(target.relative_to(base)), "size": len(text), "content": text}
+class JsonRpcError(BaseModel):
+    jsonrpc: Literal["2.0"] = "2.0"
+    error: JsonRpcErrorObj
+    id: Optional[Any] = None
+
+# --- MCP endpoints ---
+@app.get("/mcp")
+async def mcp_handshake():
+    """Простейший хэндшейк MCP."""
+    return {"mcp": True, "transport": "http", "endpoint": "/mcp", "status": "ready"}
+
+@app.post("/mcp")
+async def mcp_rpc(req: JsonRpcRequest):
+    """Эхо-заглушка JSON-RPC 2.0."""
+    try:
+        return JsonRpcResponse(result={"echo": req.params or {}, "method": req.method}, id=req.id)
+    except Exception as e:
+        return JsonRpcError(error=JsonRpcErrorObj(code=-32603, message="Internal error", data=str(e)), id=req.id)
