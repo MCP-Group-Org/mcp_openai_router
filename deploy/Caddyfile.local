@@ -1,0 +1,22 @@
+{
+  # полностью отключаем ACME в локалке
+  acme_ca off
+}
+
+# локальный хост (можно открыть через https://localhost)
+localhost, 127.0.0.1 {
+  encode zstd gzip
+
+  # self-signed локальный сертификат от самого Caddy
+  tls internal
+
+  reverse_proxy mcp-server:8080 {
+    header_up X-Forwarded-Proto {scheme}
+    header_up X-Forwarded-For {remote_host}
+  }
+}
+
+# опционально: редирект с http → https в локалке
+:80 {
+  redir https://localhost{uri}
+}
