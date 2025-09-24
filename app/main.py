@@ -5,6 +5,13 @@ from fastapi import FastAPI
 from pydantic import BaseModel, Field
 from typing import Any, Optional, Dict, Literal
 from pathlib import Path
+import os
+
+try:
+    # Optional import; the container may not have it until Dockerfile is updated
+    from openai import OpenAI
+except Exception:  # pragma: no cover
+    OpenAI = None  # type: ignore
 
 # =========================
 # FastAPI app
@@ -58,7 +65,7 @@ class ToolSpec(BaseModel):
     description: str
     schema: ToolSchema
 
-# Определяем два инструмента: echo, read_file
+# Определяем инструменты: echo, read_file, chat
 TOOLS: Dict[str, ToolSpec] = {
     "echo": ToolSpec(
         name="echo",
@@ -85,6 +92,34 @@ TOOLS: Dict[str, ToolSpec] = {
                 },
             },
             required=["path"],
+            additionalProperties=False,
+        ),
+    ),
+    "chat": ToolSpec(
+        name="chat",
+        description="Call an OpenAI-compatible router (Chat Completions).",
+        schema=ToolSchema(
+            properties={
+                "model": {"type": "string", "description": "Model name, e.g. gpt-4.1-mini"},
+                "messages": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "role": {"type": "string", "description": "system|user|assistant"},
+                            "content": {"type": "string"},
+                        },
+                        "required": ["role", "content"],
+                        "additionalProperties": False,
+                    },
+                    "description": "Chat history in OpenAI format",
+                },
+                "temperature": {"type": "number", "description": "0-2", "default": 0.7},
+                "max_tokens": {"type": "integer", "description": "Max tokens for the response"},
+                "top_p": {"type": "number", "description": "Nucleus sampling"},
+                "metadata": {"type": "object", "description": "Optional vendor-specific options"},
+            },
+            required=["model", "messages"],
             additionalProperties=False,
         ),
     ),
@@ -182,6 +217,75 @@ async def mcp_rpc(req: JsonRpcRequest):
                     )
                 rf = _safe_read_file(path, max_bytes=max_bytes)
                 return JsonRpcResponse(result=rf, id=req.id)
+
+            if name == "chat":
+                if OpenAI is None:
+                    return JsonRpcError(
+                        error=JsonRpcErrorObj(
+                            code=-32603,
+                            message="OpenAI SDK not available. Install 'openai' package.",
+                        ),
+                        id=req.id,
+                    )
+                api_key = os.getenv("OPENAI_API_KEY")
+                base_url = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
+                if not api_key:
+                    return JsonRpcError(
+                        error=JsonRpcErrorObj(
+                            code=-32602,
+                            message="Missing OPENAI_API_KEY env var",
+                        ),
+                        id=req.id,
+                    )
+                client = OpenAI(api_key=api_key, base_url=base_url)
+
+                model = arguments.get("model")
+                messages = arguments.get("messages") or []
+                temperature = arguments.get("temperature", 0.7)
+                max_tokens = arguments.get("max_tokens", None)
+                top_p = arguments.get("top_p", None)
+
+                if not isinstance(model, str) or not isinstance(messages, list):
+                    return JsonRpcError(
+                        error=JsonRpcErrorObj(
+                            code=-32602,
+                            message="Invalid params: 'model' must be string and 'messages' must be array",
+                        ),
+                        id=req.id,
+                    )
+
+                try:
+                    completion = client.chat.completions.create(
+                        model=model,
+                        messages=messages,
+                        temperature=temperature,
+                        **({"max_tokens": int(max_tokens)} if max_tokens is not None else {}),
+                        **({"top_p": float(top_p)} if top_p is not None else {}),
+                    )
+                    choice = completion.choices[0]
+                    content = (choice.message.content if getattr(choice, "message", None) else None) or ""
+                    usage = getattr(completion, "usage", None)
+                    return JsonRpcResponse(
+                        result={
+                            "id": getattr(completion, "id", None),
+                            "model": getattr(completion, "model", model),
+                            "object": getattr(completion, "object", "chat.completion"),
+                            "created": getattr(completion, "created", None),
+                            "message": {"role": "assistant", "content": content},
+                            "finish_reason": getattr(choice, "finish_reason", None),
+                            "usage": usage.model_dump() if hasattr(usage, "model_dump") and callable(getattr(usage, "model_dump")) else (usage or None),
+                        },
+                        id=req.id,
+                    )
+                except Exception as e:
+                    return JsonRpcError(
+                        error=JsonRpcErrorObj(
+                            code=-32000,
+                            message="Router call failed",
+                            data=str(e),
+                        ),
+                        id=req.id,
+                    )
 
             # защита от неучтённых
             return JsonRpcError(

@@ -8,7 +8,8 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PIP_NO_CACHE_DIR=off \
     UVICORN_WORKERS=1 \
     APP_MODULE=app.main:app \
-    PORT=8080
+    PORT=8080 \
+    OPENAI_BASE_URL=https://api.openai.com/v1
 
 # Пакеты и юзер
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -21,7 +22,7 @@ WORKDIR /app
 # Зависимости
 RUN --mount=type=cache,target=/root/.cache/pip \
     pip install --upgrade pip && \
-    pip install fastapi "uvicorn[standard]" "mcp[cli]" fastapi-mcp
+    pip install fastapi fastapi-mcp "mcp[cli]" "uvicorn[standard]" openai
 
 # Код
 COPY . /app
