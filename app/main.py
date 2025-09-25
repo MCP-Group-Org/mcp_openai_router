@@ -16,7 +16,7 @@ except Exception:  # pragma: no cover
 # =========================
 # FastAPI app
 # =========================
-app = FastAPI(title="MCP Server", version="0.1.0")
+app = FastAPI(title="MCP - OpenAI Router", version="0.1.0")
 
 # -------- Health --------
 @app.get("/health")
