@@ -63,14 +63,14 @@ class ToolSchema(BaseModel):
 class ToolSpec(BaseModel):
     name: str
     description: str
-    schema: ToolSchema
+    input_schema: ToolSchema
 
 # Определяем инструменты: echo, read_file, chat
 TOOLS: Dict[str, ToolSpec] = {
     "echo": ToolSpec(
         name="echo",
         description="Echo text back.",
-        schema=ToolSchema(
+        input_schema=ToolSchema(
             properties={
                 "text": {"type": "string", "description": "Text to echo"}
             },
@@ -81,7 +81,7 @@ TOOLS: Dict[str, ToolSpec] = {
     "read_file": ToolSpec(
         name="read_file",
         description="Read a text file from the server's /app directory (relative path).",
-        schema=ToolSchema(
+        input_schema=ToolSchema(
             properties={
                 "path": {"type": "string", "description": "Relative path under /app"},
                 "max_bytes": {
@@ -98,7 +98,7 @@ TOOLS: Dict[str, ToolSpec] = {
     "chat": ToolSpec(
         name="chat",
         description="Call an OpenAI-compatible router (Chat Completions).",
-        schema=ToolSchema(
+        input_schema=ToolSchema(
             properties={
                 "model": {"type": "string", "description": "Model name, e.g. gpt-4.1-mini"},
                 "messages": {
@@ -126,6 +126,39 @@ TOOLS: Dict[str, ToolSpec] = {
 }
 
 BASE_DIR = Path("/app").resolve()
+
+def _select_optimal_model(requested_model: Optional[str], messages: list, max_tokens: Optional[int]) -> str:
+    """
+    OpenAI Router: выбирает оптимальную модель на основе анализа запроса
+    """
+    # Если модель явно указана, используем её
+    if requested_model:
+        return requested_model
+    
+    # Анализируем запрос для выбора оптимальной модели
+    if not messages:
+        return "gpt-4.1-mini"  # fallback
+    
+    # Получаем общий текст запроса
+    full_text = " ".join([msg.get("content", "") for msg in messages if isinstance(msg, dict)])
+    full_text = full_text.lower()
+    
+    # Простая логика выбора модели
+    if max_tokens and max_tokens > 2000:
+        # Длинные ответы - используем более мощную модель
+        return "gpt-4.1-mini"
+    elif any(keyword in full_text for keyword in ["code", "programming", "debug", "algorithm", "function"]):
+        # Программирование - используем модель с хорошим пониманием кода
+        return "gpt-4.1-mini"
+    elif any(keyword in full_text for keyword in ["creative", "story", "poem", "write", "imagine"]):
+        # Творческие задачи - используем модель с креативностью
+        return "gpt-4.1-mini"
+    elif len(full_text) > 500:
+        # Сложные запросы - используем более мощную модель
+        return "gpt-4.1-mini"
+    else:
+        # Простые запросы - используем быструю модель
+        return "gpt-4.1-mini"
 
 def _safe_read_file(path: str, max_bytes: int = 200_000) -> Dict[str, Any]:
     # запрет абсолютных путей и выхода за пределы /app
@@ -179,7 +212,7 @@ async def mcp_rpc(req: JsonRpcRequest):
                     {
                         "name": spec.name,
                         "description": spec.description,
-                        "input_schema": spec.schema.model_dump(),
+                        "input_schema": spec.input_schema.model_dump(),
                     }
                     for spec in TOOLS.values()
                 ]
@@ -229,6 +262,7 @@ async def mcp_rpc(req: JsonRpcRequest):
                     )
                 api_key = os.getenv("OPENAI_API_KEY")
                 base_url = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
+                
                 if not api_key:
                     return JsonRpcError(
                         error=JsonRpcErrorObj(
@@ -239,22 +273,28 @@ async def mcp_rpc(req: JsonRpcRequest):
                     )
                 client = OpenAI(api_key=api_key, base_url=base_url)
 
-                model = arguments.get("model")
+                # OpenAI Router: динамический выбор модели
+                requested_model = arguments.get("model")
                 messages = arguments.get("messages") or []
                 temperature = arguments.get("temperature", 0.7)
                 max_tokens = arguments.get("max_tokens", None)
                 top_p = arguments.get("top_p", None)
+                
+                # Логика выбора модели на основе анализа запроса
+                model = _select_optimal_model(requested_model, messages, max_tokens)
 
-                if not isinstance(model, str) or not isinstance(messages, list):
+                if not isinstance(messages, list):
                     return JsonRpcError(
                         error=JsonRpcErrorObj(
                             code=-32602,
-                            message="Invalid params: 'model' must be string and 'messages' must be array",
+                            message="Invalid params: 'messages' must be array",
                         ),
                         id=req.id,
                     )
 
                 try:
+                    # Логируем выбранную модель
+                    print(f"OpenAI Router: Selected model '{model}' for request")
                     completion = client.chat.completions.create(
                         model=model,
                         messages=messages,
@@ -274,6 +314,11 @@ async def mcp_rpc(req: JsonRpcRequest):
                             "message": {"role": "assistant", "content": content},
                             "finish_reason": getattr(choice, "finish_reason", None),
                             "usage": usage.model_dump() if hasattr(usage, "model_dump") and callable(getattr(usage, "model_dump")) else (usage or None),
+                            "router_info": {
+                                "selected_model": model,
+                                "requested_model": requested_model,
+                                "auto_selected": requested_model is None
+                            }
                         },
                         id=req.id,
                     )
