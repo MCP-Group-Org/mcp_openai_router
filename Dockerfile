@@ -22,7 +22,7 @@ WORKDIR /app
 # Зависимости
 RUN --mount=type=cache,target=/root/.cache/pip \
     pip install --upgrade pip && \
-    pip install fastapi fastapi-mcp "mcp[cli]" openai "uvicorn[standard]"
+    pip install fastapi fastapi-mcp "mcp[cli]" openai "uvicorn[standard]" pydantic-settings
 
 # Код
 COPY . /app
