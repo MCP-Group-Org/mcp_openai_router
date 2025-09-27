@@ -62,6 +62,32 @@ MCP Client ⇄ MCP OpenAI Router ⇄ OpenAI API ⇄ Модель
 
 Напрямую через `curl` запросы к моделям не выполняются — это часть MCP-протокола.
 
+## Проверка chat-инструмента
+
+1. Убедитесь, что контейнер запущен и доступен (`docker compose up -d --build`) и заданы переменные окружения `OPENAI_API_KEY` и `MODEL`.
+2. Проверьте диагностику: `curl http://localhost:8001/diagnostics` — в блоке `tools.names` должно быть имя `chat`, а `openai.sdk_available` — `true`.
+3. Выполните тестовый JSON-RPC запрос с коротким вопросом и требованием краткого ответа:
+   ```bash
+   curl -s http://localhost:8001/mcp \
+     -H 'Content-Type: application/json' \
+     -d '{
+       "jsonrpc": "2.0",
+       "id": "chat-test",
+       "method": "tools/call",
+       "params": {
+         "name": "chat",
+         "arguments": {
+           "model": "gpt-4.1-mini",
+           "messages": [
+             {"role": "system", "content": "Ответь очень кратко."},
+             {"role": "user", "content": "ping"}
+           ]
+         }
+       }
+     }'
+   ```
+4. В ответе поле `result.message.content` должно содержать короткое подтверждение (например, `pong`). В случае ошибки проверьте `error.data` и логи (`docker compose logs -f`).
+
 ## Возможные доработки
 
 - Динамический выбор моделей.
