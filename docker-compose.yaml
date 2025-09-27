@@ -1,39 +1,31 @@
 version: "3.9"
 
 services:
-  mcp-server:
+  mcp-openai-router:
     build:
       context: .
       dockerfile: Dockerfile
-    container_name: mcp-server
+    container_name: mcp-openai-router
     restart: unless-stopped
     env_file:
       - .env
+    # Внутренний порт сервиса для контейнеров в сети mcp-net
     expose:
-      - "8080" # приложение слушает внутри контейнера
-    volumes:
-      - ./:/app:rw
+      - "8000"
+    # Доступ с хоста (локально): 127.0.0.1:8001 -> контейнер:8000
+    # Если не нужен доступ с хоста — удалите весь блок 'ports'.
+    ports:
+      - "127.0.0.1:8001:8000"
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      test: ["CMD", "curl", "-f", "http://mcp-openai-router:8000/health"]
       interval: 30s
       timeout: 5s
       retries: 3
-
-  caddy:
-    image: caddy:2
-    container_name: caddy
-    restart: unless-stopped
-    ports:
-      - "80:80"
-      - "443:443"
     volumes:
-      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
-      - caddy_data:/data
-      - caddy_config:/config
-    environment:
-      - DOMAIN=${DOMAIN}
-      - ACME_EMAIL=${ACME_EMAIL}
+      - ./:/app
+    networks:
+      - mcp-net
 
-volumes:
-  caddy_data:
-  caddy_config:
+networks:
+  mcp-net:
+    external: true

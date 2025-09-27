@@ -8,7 +8,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PIP_NO_CACHE_DIR=off \
     UVICORN_WORKERS=1 \
     APP_MODULE=app.main:app \
-    PORT=8080 \
+    ROUTER_PORT=8000 \
     OPENAI_BASE_URL=https://api.openai.com/v1
 
 # Пакеты и юзер
@@ -22,15 +22,15 @@ WORKDIR /app
 # Зависимости
 RUN --mount=type=cache,target=/root/.cache/pip \
     pip install --upgrade pip && \
-    pip install fastapi fastapi-mcp "mcp[cli]" "uvicorn[standard]" openai
+    pip install fastapi fastapi-mcp "mcp[cli]" openai "uvicorn[standard]" pydantic-settings
 
 # Код
 COPY . /app
 RUN chown -R appuser:appuser /app
 USER appuser
 
-# Слушаем тот же порт, что в .env (8080)
-EXPOSE 8080
+# Слушаем тот же порт, что в .env (8000)
+EXPOSE 8000
 
 # Безопасные дефолты на случай отсутствия .env
-CMD ["sh", "-lc", "uvicorn ${APP_MODULE:-app.main:app} --host 0.0.0.0 --port ${PORT:-8080}"]
+CMD ["sh", "-lc", "uvicorn ${APP_MODULE:-app.main:app} --host 0.0.0.0 --port ${ROUTER_PORT:-8000}"]
