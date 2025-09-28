@@ -97,5 +97,3 @@ MCP Client ⇄ MCP OpenAI Router ⇄ OpenAI API ⇄ Модель
 - Набор автотестов и CI/CD pipeline.
 
 ## Лицензия
-
-MIT License.
