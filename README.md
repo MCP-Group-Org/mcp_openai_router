@@ -56,3 +56,18 @@
 - **LangGraph вместо старых агентов LangChain**: меньше риск миграции, проще контроль оркестрации.
 - **Разделение сервисов**: ядро MCP и Telegram-бот вынесены в разные контейнеры.
 - **Безопасность**: токен и список разрешённых пользователей задаются только в `.env` на сервере.
+
+## MCP OpenAI Router
+
+- **Совместимость:** сервис реализует MCP-handshake (`initialize`/`ping`/`shutdown`) и поддерживает `tools/list`, `tools/call` в формате спецификации 1.0. Дополнительный `GET /mcp` возвращает справочную информацию о протоколе.
+- **Инструменты:** `echo`, `read_file`, `chat`. Роутер возвращает `content`, `toolCalls`, `metadata` и `isError` в ответ на `tools/call`.
+- **Hosted tools:** если OpenAI Responses API вернул `tool_call`, он транслируется в MCP `toolCalls`. Параметр `parallelToolCalls` передаётся в OpenAI.
+- **Legacy-режим:** для обратной совместимости с методами `tools.echo` / `tools.read_file` запускать сервис с флагом `--legacy` или переменной `MCP_ENABLE_LEGACY=1`.
+- **Тесты:** `pip install pytest httpx` и `python3 -m pytest`. Интеграционный тест покрывает цепочку `initialize → tools/list → tools/call(chat)`; OpenAI SDK подменяется стабом, поэтому сетевые запросы не выполняются.
+- **Переменные окружения:** `OPENAI_API_KEY` (обязательно), `OPENAI_BASE_URL` (опционально, по умолчанию `https://api.openai.com/v1`).
+- **Пример JSON-RPC:** 
+  ```json
+  {"jsonrpc":"2.0","id":1,"method":"initialize","params":{"clientInfo":{"name":"demo","version":"0.1"},"capabilities":{}}}
+  {"jsonrpc":"2.0","id":2,"method":"tools/list","params":{"sessionId":"<session>"}}
+  {"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"sessionId":"<session>","name":"chat","arguments":{"model":"gpt-4.1-mini","messages":[{"role":"user","content":"ping"}]}}}
+  ```
