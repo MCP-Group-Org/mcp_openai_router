@@ -5,19 +5,26 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    container_name: mcp-server
+    container_name: ${MCP_OPENAI_ROUTER_ENDPOINT}
     restart: unless-stopped
     env_file:
       - .env
     expose:
-      - "8080" # приложение слушает внутри контейнера
+      - "${PORT}"
     volumes:
       - ./:/app:rw
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      test:
+        - CMD-SHELL
+        - curl -f http://localhost:${PORT}/health
       interval: 30s
       timeout: 5s
       retries: 3
+    networks:
+      default:
+      mcp-net:
+        aliases:
+          - ${MCP_OPENAI_ROUTER_ENDPOINT}
 
   caddy:
     image: caddy:2
@@ -33,7 +40,14 @@ services:
     environment:
       - DOMAIN=${DOMAIN}
       - ACME_EMAIL=${ACME_EMAIL}
+    networks:
+      default:
+      mcp-net:
 
 volumes:
   caddy_data:
   caddy_config:
+
+networks:
+  mcp-net:
+    external: true
