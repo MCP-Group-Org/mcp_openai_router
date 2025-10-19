@@ -1,17 +1,13 @@
+version: "3.9"
 services:
-  mcp-openai-router:
+  mcp-server:
     build:
       context: .
       dockerfile: Dockerfile
-    container_name: ${MCP_OPENAI_ROUTER_ENDPOINT}
     restart: unless-stopped
-    env_file:
-      - .env
-    # Внутренний порт сервиса для контейнеров в сети mcp-net
-    expose:
-      - "${PORT}"
-    volumes:
-      - ./:/app:rw
+    container_name: ${MCP_OPENAI_ROUTER_ENDPOINT}
+    expose: ["${PORT}"]
+    volumes: [".:/app:rw"]
     healthcheck:
       test:
         - CMD-SHELL
@@ -27,18 +23,14 @@ services:
 
   caddy:
     image: caddy:2
-    container_name: caddy
     restart: unless-stopped
     ports:
       - "80:80"
       - "443:443"
     volumes:
-      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./deploy/Caddyfile.local:/etc/caddy/Caddyfile:ro
       - caddy_data:/data
       - caddy_config:/config
-    environment:
-      - DOMAIN=${DOMAIN}
-      - ACME_EMAIL=${ACME_EMAIL}
     networks:
       default:
       mcp-net:

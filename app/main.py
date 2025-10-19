@@ -6,71 +6,33 @@
 """
 from __future__ import annotations
 
-from fastapi import FastAPI
-from pydantic import BaseModel, Field
-from pydantic_settings import BaseSettings, SettingsConfigDict
-from typing import Any, Optional, Dict, Literal, Callable, Awaitable, List
+import json
+import logging
+import os
+import sys
 from pathlib import Path
+from typing import Any, Callable, Dict, List, Optional, Tuple, Literal
+from uuid import uuid4
+
+from fastapi import FastAPI
+from pydantic import BaseModel, Field, ValidationError
 
 try:
-    from openai import OpenAI  # >=1.x
+    # Optional runtime dependency; in tests we patch the factory instead.
+    from openai import OpenAI
 except Exception:  # pragma: no cover
-    OpenAI = None  # type: ignore
+    OpenAI = None  # type: ignore[assignment]
 
-ROOT_DIR = Path(__file__).resolve().parent.parent
-ENV_FILE_PATH = ROOT_DIR / ".env"
 
-# =========================
-# Configuration
-# =========================
-
-class Settings(BaseSettings):
-    """Конфигурация приложения через переменные окружения."""
-    openai_api_key: str = Field(..., description="OpenAI API ключ")
-    openai_base_url: str = Field(
-        default="https://api.openai.com/v1",
-        description="Базовый URL OpenAI API",
-    )
-    default_model: str = Field(
-        default="gpt-4.1-mini",
-        description="Модель по умолчанию",
-    )
-
-    model_config = SettingsConfigDict(
-        env_file=str(ENV_FILE_PATH),
-        env_file_encoding="utf-8",
-        extra="ignore",
-    )
-
-settings = Settings()
+logger = logging.getLogger("mcp_openai_router")
+if not logger.handlers:
+    logging.basicConfig(level=logging.INFO)
 
 # =========================
 # FastAPI app
 # =========================
-app = FastAPI(title="MCP - OpenAI Router", version="0.1.1")
+app = FastAPI(title="MCP - OpenAI Router", version="0.0.2")
 
-# -------- Health --------
-@app.get("/health")
-async def health():
-    return {"status": "ok"}
-
-@app.get("/diagnostics")
-async def diagnostics():
-    return {
-        "status": "ok",
-        "app": {"title": app.title, "version": app.version},
-        "openai": {
-            "sdk_available": OpenAI is not None,
-            "base_url": settings.openai_base_url,
-            "default_model": settings.default_model,
-            "api_key_set": bool(settings.openai_api_key),
-        },
-        "tools": {"count": len(TOOLS), "names": list(TOOLS.keys())},
-        "filesystem": {
-            "base_dir": str(BASE_DIR),
-            "base_dir_exists": BASE_DIR.exists(),
-        },
-    }
 
 # -------- JSON-RPC 2.0 models --------
 class JsonRpcRequest(BaseModel):
@@ -79,54 +41,118 @@ class JsonRpcRequest(BaseModel):
     params: Optional[Dict[str, Any]] = None
     id: Optional[Any] = None
 
+
 class JsonRpcResponse(BaseModel):
     jsonrpc: Literal["2.0"] = "2.0"
     result: Any = None
     id: Optional[Any] = None
+
 
 class JsonRpcErrorObj(BaseModel):
     code: int
     message: str
     data: Optional[Any] = None
 
+
 class JsonRpcError(BaseModel):
     jsonrpc: Literal["2.0"] = "2.0"
     error: JsonRpcErrorObj
     id: Optional[Any] = None
 
-# -------- MCP handshake (GET) --------
-@app.get("/mcp")
-async def mcp_handshake():
-    return {"mcp": True, "transport": "http", "endpoint": "/mcp", "status": "ready"}
+
+# -------- MCP models --------
+class InitializeParams(BaseModel):
+    protocolVersion: Optional[str] = None
+    clientInfo: Dict[str, Any] = Field(default_factory=dict)
+    capabilities: Dict[str, Any] = Field(default_factory=dict)
+
+
+class SessionState(BaseModel):
+    id: str
+    client_info: Dict[str, Any] = Field(default_factory=dict)
+    capabilities: Dict[str, Any] = Field(default_factory=dict)
+
 
 # =========================
-# Minimal MCP tool registry
+# Constants and feature flags
 # =========================
+PROTOCOL_VERSION = "1.0"
+SERVER_INFO = {
+    "name": "mcp-openai-router",
+    "version": os.getenv("APP_VERSION", "0.0.2"),
+}
+SERVER_CAPABILITIES = {
+    "tools": {
+        "listChangedNotification": False,
+        "parallelCalls": True,
+    },
+    "sampling": {
+        "supportsHostedTools": True,
+    },
+}
+ENABLE_LEGACY_METHODS = (
+    "--legacy" in sys.argv
+    or os.getenv("MCP_ENABLE_LEGACY", "").lower() in {"1", "true", "yes"}
+)
+BASE_DIR = Path("/app").resolve()
+ACTIVE_SESSIONS: Dict[str, SessionState] = {}
+REQUIRE_SESSION = os.getenv("MCP_REQUIRE_SESSION", "1").strip().lower() in {"1", "true", "yes", "on"}
 
+
+# =========================
+# MCP tool registry
+# =========================
 class ToolSchema(BaseModel):
     type: Literal["object"] = "object"
-    properties: Dict[str, Any]
-    required: list[str] = Field(default_factory=list)
+    properties: Dict[str, Any] = Field(default_factory=dict)
+    required: List[str] = Field(default_factory=list)
     additionalProperties: bool = False
+
+    def as_dict(self) -> Dict[str, Any]:
+        return self.model_dump()
+
 
 class ToolSpec(BaseModel):
     name: str
     description: str
     input_schema: ToolSchema
+    output_schema: Optional[ToolSchema] = None
+
+    def as_mcp_dict(self) -> Dict[str, Any]:
+        payload = {
+            "name": self.name,
+            "description": self.description,
+            "inputSchema": self.input_schema.as_dict(),
+        }
+        if self.output_schema is not None:
+            payload["outputSchema"] = self.output_schema.as_dict()
+        return payload
+
+
+ToolResponse = Dict[str, Any]
+ToolHandler = Callable[[Dict[str, Any]], ToolResponse]
+
 
 TOOLS: Dict[str, ToolSpec] = {
     "echo": ToolSpec(
         name="echo",
         description="Echo text back.",
         input_schema=ToolSchema(
-            properties={"text": {"type": "string", "description": "Text to echo"}},
+            properties={
+                "text": {"type": "string", "description": "Text to echo"},
+            },
             required=["text"],
-            additionalProperties=False,
+        ),
+        output_schema=ToolSchema(
+            properties={
+                "content": {"type": "array", "description": "Single text block"},
+                "isError": {"type": "boolean"},
+            },
         ),
     ),
     "read_file": ToolSpec(
         name="read_file",
-        description="Read a text file from the server's /app directory (relative path).",
+        description="Read a UTF-8 text file from the server's /app directory (relative path).",
         input_schema=ToolSchema(
             properties={
                 "path": {"type": "string", "description": "Relative path under /app"},
@@ -138,12 +164,17 @@ TOOLS: Dict[str, ToolSpec] = {
                 },
             },
             required=["path"],
-            additionalProperties=False,
+        ),
+        output_schema=ToolSchema(
+            properties={
+                "content": {"type": "array"},
+                "isError": {"type": "boolean"},
+            },
         ),
     ),
     "chat": ToolSpec(
         name="chat",
-        description="Call an OpenAI-compatible router. Supports hosted tools via Responses API when 'tools' are provided.",
+        description="Call an OpenAI Responses API compatible endpoint.",
         input_schema=ToolSchema(
             properties={
                 "model": {"type": "string", "description": "Model name, e.g. gpt-4.1-mini"},
@@ -152,16 +183,21 @@ TOOLS: Dict[str, ToolSpec] = {
                     "items": {
                         "type": "object",
                         "properties": {
-                            "role": {"type": "string", "description": "system|user|assistant"},
-                            "content": {"type": "string"},
+                            "role": {"type": "string", "description": "system|user|assistant|tool"},
+                            "content": {
+                                "anyOf": [
+                                    {"type": "string"},
+                                    {"type": "array", "items": {"type": "object"}},
+                                ]
+                            },
                         },
                         "required": ["role", "content"],
                         "additionalProperties": False,
                     },
-                    "description": "Chat history (OpenAI format).",
+                    "description": "Conversation history in OpenAI chat format.",
                 },
-                "temperature": {"type": "number", "description": "0-2", "default": 0.7},
-                "max_tokens": {"type": "integer", "description": "Max tokens for the response"},
+                "temperature": {"type": "number", "description": "0-2 range", "default": 0.7},
+                "max_tokens": {"type": "integer", "description": "Max output tokens for the response"},
                 "top_p": {"type": "number", "description": "Nucleus sampling"},
                 # ❗ Новое: для hosted tools (например, web_search в Responses API)
                 "tools": {
@@ -174,215 +210,464 @@ TOOLS: Dict[str, ToolSpec] = {
                     "description": "Tool choice mode for Responses API (e.g., 'auto').",
                 },
                 "metadata": {"type": "object", "description": "Optional vendor-specific options"},
+                "parallelToolCalls": {
+                    "type": "boolean",
+                    "description": "Allow hosted tools to run in parallel",
+                },
             },
             required=["model", "messages"],
-            additionalProperties=False,
+        ),
+        output_schema=ToolSchema(
+            properties={
+                "content": {"type": "array"},
+                "toolCalls": {"type": "array"},
+                "isError": {"type": "boolean"},
+            },
         ),
     ),
 }
 
-BASE_DIR = Path("/app").resolve()
-
-def _get_model(requested_model: Optional[str]) -> str:
-    return requested_model or settings.default_model
-
-def _safe_read_file(path: str, max_bytes: int = 200_000) -> Dict[str, Any]:
-    p_raw = Path(path)
-    if p_raw.is_absolute() or ".." in p_raw.parts:
-        return {"path": str(p_raw), "size": 0, "text": "", "error": "Invalid path (absolute or traversal not allowed)"}
-    target = (BASE_DIR / p_raw).resolve()
-    if not str(target).startswith(str(BASE_DIR)):
-        return {"path": str(p_raw), "size": 0, "text": "", "error": "Path escapes base directory"}
-    try:
-        data = target.read_bytes()[: max(1, int(max_bytes))]
-        return {"path": str(p_raw), "size": len(data), "text": data.decode("utf-8", errors="replace")}
-    except FileNotFoundError:
-        return {"path": str(p_raw), "size": 0, "text": "", "error": "File not found"}
-    except Exception as e:
-        return {"path": str(p_raw), "size": 0, "text": "", "error": f"{type(e).__name__}: {e}"}
 
 # =========================
-# JSON-RPC helpers
+# Helper utilities
 # =========================
-
-def _invalid_params_error(message: str, req_id: Any) -> JsonRpcError:
-    return JsonRpcError(error=JsonRpcErrorObj(code=-32602, message=message), id=req_id)
-
-def _tool_not_found_error(req_id: Any) -> JsonRpcError:
+def _json_rpc_error(code: int, message: str, *, data: Any = None, request_id: Any = None) -> JsonRpcError:
     return JsonRpcError(
-        error=JsonRpcErrorObj(code=-32601, message="Tool not found", data={"available": list(TOOLS.keys())}),
-        id=req_id,
+        error=JsonRpcErrorObj(code=code, message=message, data=data),
+        id=request_id,
     )
 
-def _unimplemented_tool_error(req_id: Any) -> JsonRpcError:
-    return JsonRpcError(error=JsonRpcErrorObj(code=-32601, message="Tool handler not implemented"), id=req_id)
 
-ToolCallHandler = Callable[[Dict[str, Any], Any], JsonRpcResponse | JsonRpcError]
-MethodHandler = Callable[[JsonRpcRequest], Awaitable[JsonRpcResponse | JsonRpcError]]
+class McpSessionError(Exception):
+    def __init__(self, message: str, *, code: int = -32002, data: Any = None) -> None:
+        super().__init__(message)
+        self.code = code
+        self.data = data
 
-def _tool_echo(arguments: Dict[str, Any], req_id: Any) -> JsonRpcResponse:
-    text = arguments.get("text", "")
-    return JsonRpcResponse(result={"text": str(text)}, id=req_id)
 
-def _tool_read_file(arguments: Dict[str, Any], req_id: Any) -> JsonRpcResponse | JsonRpcError:
-    path = arguments.get("path")
-    max_bytes = int(arguments.get("max_bytes", 200_000))
-    if not isinstance(path, str):
-        return _invalid_params_error("Invalid params: 'path' must be string", req_id)
-    rf = _safe_read_file(path, max_bytes=max_bytes)
-    return JsonRpcResponse(result=rf, id=req_id)
+def _require_session(params: Dict[str, Any]) -> SessionState:
+    session_id = params.get("sessionId")
+    if not isinstance(session_id, str) or not session_id:
+        if not REQUIRE_SESSION:
+            session_id = "_auto"
+            session = ACTIVE_SESSIONS.get(session_id)
+            if session is None:
+                session = SessionState(id=session_id)
+                ACTIVE_SESSIONS[session_id] = session
+            params["sessionId"] = session_id
+            return session
+        raise McpSessionError("Missing sessionId", code=-32602)
+    session = ACTIVE_SESSIONS.get(session_id)
+    if session is None:
+        if not REQUIRE_SESSION:
+            session = SessionState(id=session_id)
+            ACTIVE_SESSIONS[session_id] = session
+        else:
+            raise McpSessionError(f"Unknown sessionId '{session_id}'", code=-32003)
+    return session
 
-def _tool_chat(arguments: Dict[str, Any], req_id: Any) -> JsonRpcResponse | JsonRpcError:
-    """Проксирует запрос в OpenAI:
-    - если переданы tools/tool_choice -> используем Responses API (hosted tools)
-    - иначе -> Chat Completions (обратная совместимость)
-    """
+
+def _tool_ok(
+    *,
+    content: Optional[List[Dict[str, Any]]] = None,
+    tool_calls: Optional[List[Dict[str, Any]]] = None,
+    metadata: Optional[Dict[str, Any]] = None,
+) -> ToolResponse:
+    payload: ToolResponse = {
+        "content": content or [],
+        "toolCalls": tool_calls or [],
+        "isError": False,
+    }
+    if metadata:
+        payload["metadata"] = metadata
+    return payload
+
+
+def _tool_error(message: str, *, metadata: Optional[Dict[str, Any]] = None) -> ToolResponse:
+    payload = {
+        "content": [{"type": "text", "text": message}],
+        "toolCalls": [],
+        "isError": True,
+    }
+    if metadata:
+        payload["metadata"] = metadata
+    return payload
+
+
+def _safe_read_file(path: str, *, max_bytes: int = 200_000) -> Dict[str, Any]:
+    raw = Path(path)
+    if raw.is_absolute() or ".." in raw.parts:
+        return {
+            "error": "Invalid path (absolute paths and traversal are not allowed)",
+            "path": str(raw),
+            "text": "",
+            "size": 0,
+        }
+    target = (BASE_DIR / raw).resolve()
+    if not str(target).startswith(str(BASE_DIR)):
+        return {
+            "error": "Path escapes base directory",
+            "path": str(raw),
+            "text": "",
+            "size": 0,
+        }
+    try:
+        data = target.read_bytes()[: max(1, int(max_bytes))]
+    except FileNotFoundError:
+        return {"error": "File not found", "path": str(raw), "text": "", "size": 0}
+    except Exception as exc:  # pragma: no cover - guardrail
+        return {
+            "error": f"{type(exc).__name__}: {exc}",
+            "path": str(raw),
+            "text": "",
+            "size": 0,
+        }
+    return {
+        "path": str(raw),
+        "size": len(data),
+        "text": data.decode("utf-8", errors="replace"),
+    }
+
+
+def _create_openai_client() -> Any:
     if OpenAI is None:
-        return JsonRpcError(
-            error=JsonRpcErrorObj(code=-32603, message="OpenAI SDK not available. Install 'openai' package."),
-            id=req_id,
+        raise RuntimeError("OpenAI SDK not available. Install the 'openai' package.")
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        raise RuntimeError("Missing OPENAI_API_KEY env var")
+    base_url = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
+    return OpenAI(api_key=api_key, base_url=base_url)
+
+
+def _maybe_model_dump(value: Any) -> Dict[str, Any]:
+    if value is None:
+        return {}
+    if hasattr(value, "model_dump") and callable(value.model_dump):
+        return value.model_dump()
+    if hasattr(value, "dict") and callable(value.dict):
+        return value.dict()  # type: ignore[return-value]
+    if isinstance(value, dict):
+        return value
+    try:
+        return json.loads(value)  # type: ignore[arg-type]
+    except Exception:
+        return {}
+
+
+def _convert_tool_call_block(block: Dict[str, Any]) -> Dict[str, Any]:
+    arguments = block.get("arguments")
+    if isinstance(arguments, str):
+        try:
+            arguments = json.loads(arguments)
+        except json.JSONDecodeError:
+            arguments = {"raw": arguments}
+    elif arguments is None:
+        arguments = {}
+    return {
+        "id": block.get("id") or block.get("tool_call_id"),
+        "toolName": block.get("name") or block.get("tool_name"),
+        "arguments": arguments,
+    }
+
+
+def _normalise_responses_output(data: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], Dict[str, Any]]:
+    content_blocks: List[Dict[str, Any]] = []
+    tool_calls: List[Dict[str, Any]] = []
+
+    outputs = data.get("output") or data.get("outputs") or []
+    for output in outputs:
+        output_type = output.get("type")
+        if output_type == "message":
+            for block in output.get("content", []):
+                block_type = block.get("type")
+                if block_type in {"output_text", "text", "input_text"}:
+                    text = block.get("text") or block.get("value") or ""
+                    if text:
+                        content_blocks.append({"type": "text", "text": text})
+                elif block_type == "tool_call":
+                    tool_calls.append(_convert_tool_call_block(block))
+        elif output_type in {"output_text", "text"}:
+            text = output.get("text") or ""
+            if text:
+                content_blocks.append({"type": "text", "text": text})
+
+    usage = data.get("usage") or {}
+    finish_reason = data.get("status") or data.get("finish_reason")
+    metadata: Dict[str, Any] = {}
+    if usage:
+        metadata["usage"] = usage
+    if finish_reason:
+        metadata["finishReason"] = finish_reason
+    if data.get("id"):
+        metadata["responseId"] = data["id"]
+    return content_blocks, tool_calls, metadata
+
+
+def _normalise_chat_completion(data: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], Dict[str, Any]]:
+    content_blocks: List[Dict[str, Any]] = []
+    tool_calls: List[Dict[str, Any]] = []
+    metadata: Dict[str, Any] = {}
+
+    choices = data.get("choices") or []
+    if not choices:
+        return content_blocks, tool_calls, metadata
+
+    first = choices[0]
+    message = first.get("message") or {}
+    content = message.get("content")
+    if isinstance(content, list):
+        for item in content:
+            if isinstance(item, dict) and item.get("type") == "text":
+                text = item.get("text")
+                if text:
+                    content_blocks.append({"type": "text", "text": text})
+    elif isinstance(content, str) and content:
+        content_blocks.append({"type": "text", "text": content})
+
+    for call in message.get("tool_calls") or []:
+        function = call.get("function") or {}
+        arguments = function.get("arguments")
+        if isinstance(arguments, str):
+            try:
+                arguments = json.loads(arguments)
+            except json.JSONDecodeError:
+                arguments = {"raw": arguments}
+        tool_calls.append(
+            {
+                "id": call.get("id"),
+                "toolName": function.get("name") or call.get("type"),
+                "arguments": arguments or {},
+            }
         )
 
-    client = OpenAI(api_key=settings.openai_api_key, base_url=settings.openai_base_url)
+    usage = data.get("usage") or {}
+    finish_reason = first.get("finish_reason")
+    if usage:
+        metadata["usage"] = usage
+    if finish_reason:
+        metadata["finishReason"] = finish_reason
+    if data.get("id"):
+        metadata["responseId"] = data["id"]
+    return content_blocks, tool_calls, metadata
 
-    requested_model = arguments.get("model")
-    messages: List[Dict[str, str]] = arguments.get("messages") or []
-    temperature = arguments.get("temperature", 0.7)
-    max_tokens = arguments.get("max_tokens")
-    top_p = arguments.get("top_p")
-    tools = arguments.get("tools")
-    tool_choice = arguments.get("tool_choice")
 
-    model = _get_model(requested_model)
+def _handle_echo(arguments: Dict[str, Any]) -> ToolResponse:
+    text = arguments.get("text")
+    if not isinstance(text, str):
+        return _tool_error("Invalid params: 'text' must be a string")
+    return _tool_ok(content=[{"type": "text", "text": text}])
+
+
+def _handle_read_file(arguments: Dict[str, Any]) -> ToolResponse:
+    path = arguments.get("path")
+    if not isinstance(path, str):
+        return _tool_error("Invalid params: 'path' must be a string")
+    max_bytes_raw = arguments.get("max_bytes", 200_000)
+    try:
+        max_bytes = int(max_bytes_raw)
+    except Exception:
+        return _tool_error("Invalid params: 'max_bytes' must be an integer")
+    result = _safe_read_file(path, max_bytes=max_bytes)
+    if result.get("error"):
+        return _tool_error(result["error"], metadata={"path": result.get("path")})
+    metadata = {"path": result["path"], "size": result["size"]}
+    return _tool_ok(content=[{"type": "text", "text": result["text"]}], metadata=metadata)
+
+
+def _handle_chat(arguments: Dict[str, Any]) -> ToolResponse:
+    model = arguments.get("model")
+    messages = arguments.get("messages")
+    if not isinstance(model, str):
+        return _tool_error("Invalid params: 'model' must be a string")
     if not isinstance(messages, list):
-        return _invalid_params_error("Invalid params: 'messages' must be array", req_id)
+        return _tool_error("Invalid params: 'messages' must be an array")
 
     try:
-        # --- ВЕТКА 1: Responses API (hosted tools / web_search) ---
-        if isinstance(tools, list) or isinstance(tool_choice, str):
-            # Преобразуем messages в input формата Responses API (он принимает такой же массив ролей).
-            resp = client.responses.create(
-                model=model,
-                input=messages,  # [{"role":"system","content":"..."}, ...]
-                temperature=temperature,
-                **({"max_output_tokens": int(max_tokens)} if max_tokens is not None else {}),
-                **({"top_p": float(top_p)} if top_p is not None else {}),
-                **({"tools": tools} if isinstance(tools, list) else {}),
-                **({"tool_choice": tool_choice} if isinstance(tool_choice, str) else {}),
-            )
-            # Нормализуем ответ под «message»-стиль
-            output_text = (getattr(resp, "output_text", None) or "").strip()
-            return JsonRpcResponse(
-                result={
-                    "id": getattr(resp, "id", None),
-                    "model": model,
-                    "object": "response",
-                    "created": None,
-                    "message": {"role": "assistant", "content": output_text},
-                    "finish_reason": None,
-                    "usage": None,
-                },
-                id=req_id,
-            )
+        client = _create_openai_client()
+    except RuntimeError as exc:
+        return _tool_error(str(exc))
 
-        # --- ВЕТКА 2: Chat Completions (старый путь, без tools) ---
-        completion = client.chat.completions.create(
-            model=model,
-            messages=messages,
-            temperature=temperature,
-            **({"max_tokens": int(max_tokens)} if max_tokens is not None else {}),
-            **({"top_p": float(top_p)} if top_p is not None else {}),
-        )
-        choice = completion.choices[0]
-        content = (choice.message.content if getattr(choice, "message", None) else None) or ""
-        usage = getattr(completion, "usage", None)
-        return JsonRpcResponse(
-            result={
-                "id": getattr(completion, "id", None),
-                "model": getattr(completion, "model", model),
-                "object": getattr(completion, "object", "chat.completion"),
-                "created": getattr(completion, "created", None),
-                "message": {"role": "assistant", "content": content},
-                "finish_reason": getattr(choice, "finish_reason", None),
-                "usage": usage.model_dump() if hasattr(usage, "model_dump") and callable(getattr(usage, "model_dump")) else (usage or None),
-            },
-            id=req_id,
-        )
+    temperature = arguments.get("temperature", 0.7)
+    top_p = arguments.get("top_p")
+    max_tokens = arguments.get("max_tokens")
+    metadata = arguments.get("metadata")
+    parallel_tool_calls = arguments.get("parallelToolCalls")
+    tools = arguments.get("tools")
+    tool_choice = arguments.get("tool_choice") or arguments.get("toolChoice")
 
-    except Exception as e:
-        return JsonRpcError(
-            error=JsonRpcErrorObj(code=-32000, message="Router call failed", data=str(e)),
-            id=req_id,
-        )
+    input_messages: List[Dict[str, Any]] = []
+    for msg in messages:
+        if not isinstance(msg, dict):
+            return _tool_error("Invalid params: every message must be an object")
+        role = msg.get("role")
+        content = msg.get("content")
+        if not isinstance(role, str):
+            return _tool_error("Invalid params: message role must be a string")
+        if isinstance(content, list):
+            cleaned = [item for item in content if isinstance(item, dict)]
+            input_messages.append({"role": role, "content": cleaned})
+        else:
+            input_messages.append({"role": role, "content": content})
 
-TOOL_CALL_HANDLERS: Dict[str, ToolCallHandler] = {
-    "echo": _tool_echo,
-    "read_file": _tool_read_file,
-    "chat": _tool_chat,
-}
-
-async def _handle_tools_list(req: JsonRpcRequest) -> JsonRpcResponse:
-    result = {
-        "tools": [
-            {"name": spec.name, "description": spec.description, "input_schema": spec.input_schema.model_dump()}
-            for spec in TOOLS.values()
-        ]
+    request_payload: Dict[str, Any] = {
+        "model": model,
+        "input": input_messages,
+        "temperature": float(temperature),
     }
-    return JsonRpcResponse(result=result, id=req.id)
+    if tools and isinstance(tools, list):
+        request_payload["tools"] = tools
+    if metadata:
+        request_payload["metadata"] = metadata
+    if top_p is not None:
+        request_payload["top_p"] = float(top_p)
+    if max_tokens is not None:
+        request_payload["max_output_tokens"] = int(max_tokens)
+    if parallel_tool_calls is not None:
+        request_payload["parallel_tool_calls"] = bool(parallel_tool_calls)
+    if tool_choice is not None:
+        request_payload["tool_choice"] = tool_choice
 
-async def _handle_tools_call(req: JsonRpcRequest) -> JsonRpcResponse | JsonRpcError:
-    params = req.params or {}
-    name = params.get("name")
-    arguments = params.get("arguments") or {}
+    try:
+        responses_api = getattr(client, "responses")
+        if hasattr(responses_api, "create_and_poll"):
+            response = responses_api.create_and_poll(**request_payload)
+        else:
+            response = responses_api.create(**request_payload)
+        response_data = _maybe_model_dump(response)
+    except Exception as exc:  # pragma: no cover - network failures
+        logger.exception("OpenAI Responses API call failed")
+        return _tool_error(f"OpenAI call failed: {exc}")
 
-    if not isinstance(name, str):
-        return _tool_not_found_error(req.id)
-    if not isinstance(arguments, dict):
-        return _invalid_params_error("Invalid params: 'arguments' must be object", req.id)
-    if name not in TOOLS:
-        return _tool_not_found_error(req.id)
+    content_blocks, tool_calls, meta = _normalise_responses_output(response_data)
+    if not content_blocks and not tool_calls:
+        # Fallback to chat completions style payloads (legacy routers).
+        content_blocks, tool_calls, meta = _normalise_chat_completion(response_data)
+    if not content_blocks and not tool_calls and response_data:
+        content_blocks = [{"type": "text", "text": json.dumps(response_data)}]
+    return _tool_ok(content=content_blocks, tool_calls=tool_calls, metadata=meta or None)
 
-    handler = TOOL_CALL_HANDLERS.get(name)
-    if handler is None:
-        return _unimplemented_tool_error(req.id)
-    return handler(arguments, req.id)
 
-async def _handle_legacy_echo(req: JsonRpcRequest) -> JsonRpcResponse:
-    params = req.params or {}
-    text = params.get("text", "")
-    return JsonRpcResponse(result={"echo": {"text": str(text)}, "method": req.method}, id=req.id)
-
-async def _handle_legacy_read_file(req: JsonRpcRequest) -> JsonRpcResponse | JsonRpcError:
-    params = req.params or {}
-    return _tool_read_file(params, req.id)
-
-METHOD_HANDLERS: Dict[str, MethodHandler] = {
-    "tools/list": _handle_tools_list,
-    "tools/call": _handle_tools_call,
-    "tools.call": _handle_tools_call,  # <-- добавили алиас под точечную нотацию
+TOOL_HANDLERS: Dict[str, ToolHandler] = {
+    "echo": _handle_echo,
+    "read_file": _handle_read_file,
+    "chat": _handle_chat,
 }
 
-LEGACY_METHOD_HANDLERS: Dict[str, MethodHandler] = {
-    "tools.echo": _handle_legacy_echo,
-    "tools.read_file": _handle_legacy_read_file,
-}
 
 # =========================
-# JSON-RPC dispatcher
+# FastAPI routes
 # =========================
+@app.get("/health")
+async def health() -> Dict[str, str]:
+    return {"status": "ok"}
+
+
+@app.get("/mcp")
+async def mcp_info() -> Dict[str, Any]:
+    return {
+        "protocolVersion": PROTOCOL_VERSION,
+        "capabilities": SERVER_CAPABILITIES,
+        "transport": {"type": "http", "endpoint": "/mcp"},
+    }
+
 
 @app.post("/mcp")
 async def mcp_rpc(req: JsonRpcRequest):
+    method = req.method
+    params = req.params or {}
+
     try:
-        handler = METHOD_HANDLERS.get(req.method)
-        if handler is not None:
-            return await handler(req)
-        legacy_handler = LEGACY_METHOD_HANDLERS.get(req.method)
-        if legacy_handler is not None:
-            return await legacy_handler(req)
-        return JsonRpcError(
-            error=JsonRpcErrorObj(code=-32601, message="Method not found", data={"method": req.method}),
-            id=req.id,
+        if method == "initialize":
+            try:
+                parsed = InitializeParams.model_validate(params)
+            except ValidationError as exc:
+                return _json_rpc_error(-32602, "Invalid initialize params", data=exc.errors(), request_id=req.id)
+
+            session_id = str(uuid4())
+            ACTIVE_SESSIONS[session_id] = SessionState(
+                id=session_id,
+                client_info=parsed.clientInfo,
+                capabilities=parsed.capabilities,
+            )
+            result = {
+                "protocolVersion": PROTOCOL_VERSION,
+                "serverInfo": SERVER_INFO,
+                "capabilities": SERVER_CAPABILITIES,
+                "sessionId": session_id,
+            }
+            return JsonRpcResponse(result=result, id=req.id)
+
+        if method == "ping":
+            try:
+                session = _require_session(params)
+            except McpSessionError as exc:
+                return _json_rpc_error(exc.code, str(exc), data=exc.data, request_id=req.id)
+            return JsonRpcResponse(result={"sessionId": session.id}, id=req.id)
+
+        if method == "shutdown":
+            session_id = params.get("sessionId")
+            if isinstance(session_id, str):
+                ACTIVE_SESSIONS.pop(session_id, None)
+            return JsonRpcResponse(result={}, id=req.id)
+
+        if method == "tools/list":
+            try:
+                _require_session(params)
+            except McpSessionError as exc:
+                return _json_rpc_error(exc.code, str(exc), data=exc.data, request_id=req.id)
+            result = {
+                "tools": [spec.as_mcp_dict() for spec in TOOLS.values()],
+                "nextCursor": None,
+            }
+            return JsonRpcResponse(result=result, id=req.id)
+
+        if method == "tools/call":
+            try:
+                _require_session(params)
+            except McpSessionError as exc:
+                return _json_rpc_error(exc.code, str(exc), data=exc.data, request_id=req.id)
+
+            name = params.get("name")
+            arguments = params.get("arguments") or {}
+            if not isinstance(name, str) or name not in TOOL_HANDLERS:
+                return _json_rpc_error(
+                    -32601,
+                    "Tool not found",
+                    data={"available": list(TOOL_HANDLERS.keys())},
+                    request_id=req.id,
+                )
+            if not isinstance(arguments, dict):
+                return _json_rpc_error(
+                    -32602,
+                    "Invalid params: 'arguments' must be an object",
+                    request_id=req.id,
+                )
+            handler = TOOL_HANDLERS[name]
+            result = handler(arguments)
+            return JsonRpcResponse(result=result, id=req.id)
+
+        if ENABLE_LEGACY_METHODS and method in {"tools.echo", "tools.read_file"}:
+            legacy_arguments = params if isinstance(params, dict) else {}
+            if method == "tools.echo":
+                return JsonRpcResponse(
+                    result=_handle_echo(legacy_arguments),
+                    id=req.id,
+                )
+            if method == "tools.read_file":
+                return JsonRpcResponse(
+                    result=_handle_read_file(legacy_arguments),
+                    id=req.id,
+                )
+
+        return _json_rpc_error(
+            -32601,
+            "Method not found",
+            data={"method": method},
+            request_id=req.id,
         )
-    except Exception as e:
-        return JsonRpcError(error=JsonRpcErrorObj(code=-32603, message="Internal error", data=str(e)), id=req.id)
+
+    except McpSessionError as exc:
+        return _json_rpc_error(exc.code, str(exc), data=exc.data, request_id=req.id)
+    except Exception as exc:  # pragma: no cover
+        logger.exception("Unhandled MCP error")
+        return _json_rpc_error(-32603, "Internal error", data=str(exc), request_id=req.id)
