@@ -91,6 +91,7 @@ ENABLE_LEGACY_METHODS = (
 )
 BASE_DIR = Path("/app").resolve()
 ACTIVE_SESSIONS: Dict[str, SessionState] = {}
+REQUIRE_SESSION = os.getenv("MCP_REQUIRE_SESSION", "1").strip().lower() in {"1", "true", "yes", "on"}
 
 
 # =========================
@@ -232,10 +233,22 @@ class McpSessionError(Exception):
 def _require_session(params: Dict[str, Any]) -> SessionState:
     session_id = params.get("sessionId")
     if not isinstance(session_id, str) or not session_id:
+        if not REQUIRE_SESSION:
+            session_id = "_auto"
+            session = ACTIVE_SESSIONS.get(session_id)
+            if session is None:
+                session = SessionState(id=session_id)
+                ACTIVE_SESSIONS[session_id] = session
+            params["sessionId"] = session_id
+            return session
         raise McpSessionError("Missing sessionId", code=-32602)
     session = ACTIVE_SESSIONS.get(session_id)
     if session is None:
-        raise McpSessionError(f"Unknown sessionId '{session_id}'", code=-32003)
+        if not REQUIRE_SESSION:
+            session = SessionState(id=session_id)
+            ACTIVE_SESSIONS[session_id] = session
+        else:
+            raise McpSessionError(f"Unknown sessionId '{session_id}'", code=-32003)
     return session
 
 
@@ -464,6 +477,8 @@ def _handle_chat(arguments: Dict[str, Any]) -> ToolResponse:
     max_tokens = arguments.get("max_tokens")
     metadata = arguments.get("metadata")
     parallel_tool_calls = arguments.get("parallelToolCalls")
+    tools = arguments.get("tools")
+    tool_choice = arguments.get("tool_choice") or arguments.get("toolChoice")
 
     input_messages: List[Dict[str, Any]] = []
     for msg in messages:
@@ -484,6 +499,8 @@ def _handle_chat(arguments: Dict[str, Any]) -> ToolResponse:
         "input": input_messages,
         "temperature": float(temperature),
     }
+    if tools and isinstance(tools, list):
+        request_payload["tools"] = tools
     if metadata:
         request_payload["metadata"] = metadata
     if top_p is not None:
@@ -492,6 +509,8 @@ def _handle_chat(arguments: Dict[str, Any]) -> ToolResponse:
         request_payload["max_output_tokens"] = int(max_tokens)
     if parallel_tool_calls is not None:
         request_payload["parallel_tool_calls"] = bool(parallel_tool_calls)
+    if tool_choice is not None:
+        request_payload["tool_choice"] = tool_choice
 
     try:
         responses_api = getattr(client, "responses")

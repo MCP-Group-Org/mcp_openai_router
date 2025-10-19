@@ -8,7 +8,6 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PIP_NO_CACHE_DIR=off \
     UVICORN_WORKERS=1 \
     APP_MODULE=app.main:app \
-    PORT=8080 \
     OPENAI_BASE_URL=https://api.openai.com/v1
 
 # Пакеты и юзер
@@ -29,8 +28,5 @@ COPY . /app
 RUN chown -R appuser:appuser /app
 USER appuser
 
-# Слушаем тот же порт, что в .env (8080)
-EXPOSE 8080
-
-# Безопасные дефолты на случай отсутствия .env
-CMD ["sh", "-lc", "uvicorn ${APP_MODULE:-app.main:app} --host 0.0.0.0 --port ${PORT:-8080}"]
+# Порт задаётся переменной окружения PORT (обязательной для запуска)
+CMD ["sh", "-lc", "uvicorn ${APP_MODULE:-app.main:app} --host 0.0.0.0 --port ${PORT}"]
