@@ -26,7 +26,7 @@ if not logger.handlers:
 # =========================
 # FastAPI app
 # =========================
-app = FastAPI(title="MCP - OpenAI Router", version="0.2.0")
+app = FastAPI(title="MCP - OpenAI Router", version="0.0.2")
 
 
 # -------- JSON-RPC 2.0 models --------
@@ -74,7 +74,7 @@ class SessionState(BaseModel):
 PROTOCOL_VERSION = "1.0"
 SERVER_INFO = {
     "name": "mcp-openai-router",
-    "version": os.getenv("APP_VERSION", "0.2.0"),
+    "version": os.getenv("APP_VERSION", "0.0.2"),
 }
 SERVER_CAPABILITIES = {
     "tools": {

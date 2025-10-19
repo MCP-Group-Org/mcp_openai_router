@@ -81,3 +81,10 @@
   {"jsonrpc":"2.0","id":2,"method":"tools/list","params":{"sessionId":"<session>"}}
   {"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"sessionId":"<session>","name":"chat","arguments":{"model":"gpt-4.1-mini","messages":[{"role":"user","content":"ping"}]}}}
   ```
+
+## Релиз v0.0.2
+
+- Добавлена документация по агентам и обновлена дорожная карта.
+- Обновлена конфигурация `docker-compose*` с обязательным `PORT` и сетевым алиасом `MCP_OPENAI_ROUTER_ENDPOINT`.
+- Расширен обработчик `chat` поддержкой hosted tools и гибким флагом `MCP_REQUIRE_SESSION`.
+- Актуализированы тестовые сценарии и ноутбук проверки для воспроизводимости релиза.
