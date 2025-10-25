@@ -21,23 +21,23 @@ services:
         aliases:
           - ${MCP_OPENAI_ROUTER_ENDPOINT}
 
-  caddy:
-    image: caddy:2
-    restart: unless-stopped
-    ports:
-      - "80:80"
-      - "443:443"
-    volumes:
-      - ./deploy/Caddyfile.local:/etc/caddy/Caddyfile:ro
-      - caddy_data:/data
-      - caddy_config:/config
-    networks:
-      default:
-      mcp-net:
+#   caddy:
+#     image: caddy:2
+#     restart: unless-stopped
+#     ports:
+#       - "80:80"
+#       - "443:443"
+#     volumes:
+#       - ./deploy/Caddyfile.local:/etc/caddy/Caddyfile:ro
+#       - caddy_data:/data
+#       - caddy_config:/config
+#     networks:
+#       default:
+#       mcp-net:
 
-volumes:
-  caddy_data:
-  caddy_config:
+# volumes:
+#   caddy_data:
+#   caddy_config:
 
 networks:
   mcp-net:

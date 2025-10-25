@@ -17,6 +17,8 @@ from uuid import uuid4
 from fastapi import FastAPI
 from pydantic import BaseModel, Field, ValidationError
 
+from .think_client import ThinkToolClient, ThinkToolConfig, create_think_tool_client  # think-tool: конфиг+клиент
+
 try:
     # Optional runtime dependency; in tests we patch the factory instead.
     from openai import OpenAI
@@ -97,6 +99,10 @@ ENABLE_LEGACY_METHODS = (
 BASE_DIR = Path("/app").resolve()
 ACTIVE_SESSIONS: Dict[str, SessionState] = {}
 REQUIRE_SESSION = os.getenv("MCP_REQUIRE_SESSION", "1").strip().lower() in {"1", "true", "yes", "on"}
+
+# think-tool: фиксируем настройки/клиент на уровне модуля, чтобы переиспользовать внутри обработчиков
+THINK_TOOL_CONFIG = ThinkToolConfig.from_env()
+THINK_TOOL_CLIENT: Optional[ThinkToolClient] = create_think_tool_client(THINK_TOOL_CONFIG)
 
 
 # =========================
@@ -474,58 +480,83 @@ def _handle_read_file(arguments: Dict[str, Any]) -> ToolResponse:
     return _tool_ok(content=[{"type": "text", "text": result["text"]}], metadata=metadata)
 
 
-def _handle_chat(arguments: Dict[str, Any]) -> ToolResponse:
+# ---- Chat tool helpers to reduce cognitive complexity ----
+class _ChatArgError(ValueError):
+    pass
+
+
+def _extract_chat_params(arguments: Dict[str, Any]) -> Dict[str, Any]:
     model = arguments.get("model")
     messages = arguments.get("messages")
     if not isinstance(model, str):
-        return _tool_error("Invalid params: 'model' must be a string")
+        raise _ChatArgError("Invalid params: 'model' must be a string")
     if not isinstance(messages, list):
-        return _tool_error("Invalid params: 'messages' must be an array")
+        raise _ChatArgError("Invalid params: 'messages' must be an array")
+
+    return {
+        "model": model,
+        "messages": messages,
+        "temperature": float(arguments.get("temperature", 0.7)),
+        "top_p": arguments.get("top_p"),
+        "max_tokens": arguments.get("max_tokens"),
+        "metadata": arguments.get("metadata"),
+        "parallel_tool_calls": arguments.get("parallelToolCalls"),
+        "tools": arguments.get("tools"),
+        "tool_choice": arguments.get("tool_choice") or arguments.get("toolChoice"),
+    }
+
+
+def _normalize_input_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    cleaned_messages: List[Dict[str, Any]] = []
+    for msg in messages:
+        if not isinstance(msg, dict):
+            raise _ChatArgError("Invalid params: every message must be an object")
+        role = msg.get("role")
+        content = msg.get("content")
+        if not isinstance(role, str):
+            raise _ChatArgError("Invalid params: message role must be a string")
+        if isinstance(content, list):
+            cleaned = [item for item in content if isinstance(item, dict)]
+            cleaned_messages.append({"role": role, "content": cleaned})
+        else:
+            cleaned_messages.append({"role": role, "content": content})
+    return cleaned_messages
+
+
+def _build_request_payload(params: Dict[str, Any], input_messages: List[Dict[str, Any]]) -> Dict[str, Any]:
+    payload: Dict[str, Any] = {
+        "model": params["model"],
+        "input": input_messages,
+        "temperature": params["temperature"],
+    }
+    if params.get("tools") and isinstance(params.get("tools"), list):
+        payload["tools"] = params["tools"]
+    if params.get("metadata"):
+        payload["metadata"] = params["metadata"]
+    if params.get("top_p") is not None:
+        payload["top_p"] = float(params["top_p"])  # type: ignore[arg-type]
+    if params.get("max_tokens") is not None:
+        payload["max_output_tokens"] = int(params["max_tokens"])  # type: ignore[arg-type]
+    if params.get("parallel_tool_calls") is not None:
+        payload["parallel_tool_calls"] = bool(params["parallel_tool_calls"])  # type: ignore[arg-type]
+    if params.get("tool_choice") is not None:
+        payload["tool_choice"] = params["tool_choice"]
+    return payload
+
+
+def _handle_chat(arguments: Dict[str, Any]) -> ToolResponse:
+    try:
+        params = _extract_chat_params(arguments)
+        input_messages = _normalize_input_messages(params["messages"])  # type: ignore[arg-type]
+    except _ChatArgError as exc:
+        return _tool_error(str(exc))
 
     try:
         client = _create_openai_client()
     except RuntimeError as exc:
         return _tool_error(str(exc))
 
-    temperature = arguments.get("temperature", 0.7)
-    top_p = arguments.get("top_p")
-    max_tokens = arguments.get("max_tokens")
-    metadata = arguments.get("metadata")
-    parallel_tool_calls = arguments.get("parallelToolCalls")
-    tools = arguments.get("tools")
-    tool_choice = arguments.get("tool_choice") or arguments.get("toolChoice")
-
-    input_messages: List[Dict[str, Any]] = []
-    for msg in messages:
-        if not isinstance(msg, dict):
-            return _tool_error("Invalid params: every message must be an object")
-        role = msg.get("role")
-        content = msg.get("content")
-        if not isinstance(role, str):
-            return _tool_error("Invalid params: message role must be a string")
-        if isinstance(content, list):
-            cleaned = [item for item in content if isinstance(item, dict)]
-            input_messages.append({"role": role, "content": cleaned})
-        else:
-            input_messages.append({"role": role, "content": content})
-
-    request_payload: Dict[str, Any] = {
-        "model": model,
-        "input": input_messages,
-        "temperature": float(temperature),
-    }
-    if tools and isinstance(tools, list):
-        request_payload["tools"] = tools
-    if metadata:
-        request_payload["metadata"] = metadata
-    if top_p is not None:
-        request_payload["top_p"] = float(top_p)
-    if max_tokens is not None:
-        request_payload["max_output_tokens"] = int(max_tokens)
-    if parallel_tool_calls is not None:
-        request_payload["parallel_tool_calls"] = bool(parallel_tool_calls)
-    if tool_choice is not None:
-        request_payload["tool_choice"] = tool_choice
+    request_payload = _build_request_payload(params, input_messages)
 
     try:
         responses_api = getattr(client, "responses")
@@ -555,6 +586,87 @@ TOOL_HANDLERS: Dict[str, ToolHandler] = {
 
 
 # =========================
+# RPC method handlers (extracted to reduce cognitive complexity in mcp_rpc)
+# =========================
+async def _handle_initialize(params: Dict[str, Any], request_id: Any) -> JsonRpcResponse | JsonRpcError:
+    try:
+        parsed = InitializeParams.model_validate(params)
+    except ValidationError as exc:
+        return _json_rpc_error(-32602, "Invalid initialize params", data=exc.errors(), request_id=request_id)
+
+    session_id = str(uuid4())
+    ACTIVE_SESSIONS[session_id] = SessionState(
+        id=session_id,
+        client_info=parsed.clientInfo,
+        capabilities=parsed.capabilities,
+    )
+    result = {
+        "protocolVersion": PROTOCOL_VERSION,
+        "serverInfo": SERVER_INFO,
+        "capabilities": SERVER_CAPABILITIES,
+        "sessionId": session_id,
+    }
+    return JsonRpcResponse(result=result, id=request_id)
+
+async def _handle_ping(params: Dict[str, Any], request_id: Any) -> JsonRpcResponse | JsonRpcError:
+    try:
+        session = _require_session(params)
+    except McpSessionError as exc:
+        return _json_rpc_error(exc.code, str(exc), data=exc.data, request_id=request_id)
+    return JsonRpcResponse(result={"sessionId": session.id}, id=request_id)
+
+async def _handle_shutdown(params: Dict[str, Any], request_id: Any) -> JsonRpcResponse:
+    session_id = params.get("sessionId")
+    if isinstance(session_id, str):
+        ACTIVE_SESSIONS.pop(session_id, None)
+    return JsonRpcResponse(result={}, id=request_id)
+
+async def _handle_tools_list(params: Dict[str, Any], request_id: Any) -> JsonRpcResponse | JsonRpcError:
+    try:
+        _require_session(params)
+    except McpSessionError as exc:
+        return _json_rpc_error(exc.code, str(exc), data=exc.data, request_id=request_id)
+    result = {
+        "tools": [spec.as_mcp_dict() for spec in TOOLS.values()],
+        "nextCursor": None,
+    }
+    return JsonRpcResponse(result=result, id=request_id)
+
+async def _handle_tools_call(params: Dict[str, Any], request_id: Any) -> JsonRpcResponse | JsonRpcError:
+    try:
+        _require_session(params)
+    except McpSessionError as exc:
+        return _json_rpc_error(exc.code, str(exc), data=exc.data, request_id=request_id)
+
+    name = params.get("name")
+    arguments = params.get("arguments") or {}
+    if not isinstance(name, str) or name not in TOOL_HANDLERS:
+        return _json_rpc_error(
+            -32601,
+            "Tool not found",
+            data={"available": list(TOOL_HANDLERS.keys())},
+            request_id=request_id,
+        )
+    if not isinstance(arguments, dict):
+        return _json_rpc_error(
+            -32602,
+            "Invalid params: 'arguments' must be an object",
+            request_id=request_id,
+        )
+    handler = TOOL_HANDLERS[name]
+    result = handler(arguments)
+    return JsonRpcResponse(result=result, id=request_id)
+
+async def _handle_legacy(params: Dict[str, Any], method: str, request_id: Any) -> JsonRpcResponse:
+    legacy_arguments = params if isinstance(params, dict) else {}
+    if method == "tools.echo":
+        return JsonRpcResponse(result=_handle_echo(legacy_arguments), id=request_id)
+    if method == "tools.read_file":
+        return JsonRpcResponse(result=_handle_read_file(legacy_arguments), id=request_id)
+    # Fallback should not occur due to caller checks; return method not found to be safe
+    return JsonRpcResponse(result=_tool_error("Legacy method not supported"), id=request_id)
+
+# =========================
 # FastAPI routes
 # =========================
 @app.get("/health")
@@ -577,87 +689,21 @@ async def mcp_rpc(req: JsonRpcRequest):
     params = req.params or {}
 
     try:
+        # Fast path dispatch table
         if method == "initialize":
-            try:
-                parsed = InitializeParams.model_validate(params)
-            except ValidationError as exc:
-                return _json_rpc_error(-32602, "Invalid initialize params", data=exc.errors(), request_id=req.id)
-
-            session_id = str(uuid4())
-            ACTIVE_SESSIONS[session_id] = SessionState(
-                id=session_id,
-                client_info=parsed.clientInfo,
-                capabilities=parsed.capabilities,
-            )
-            result = {
-                "protocolVersion": PROTOCOL_VERSION,
-                "serverInfo": SERVER_INFO,
-                "capabilities": SERVER_CAPABILITIES,
-                "sessionId": session_id,
-            }
-            return JsonRpcResponse(result=result, id=req.id)
-
+            return await _handle_initialize(params, req.id)
         if method == "ping":
-            try:
-                session = _require_session(params)
-            except McpSessionError as exc:
-                return _json_rpc_error(exc.code, str(exc), data=exc.data, request_id=req.id)
-            return JsonRpcResponse(result={"sessionId": session.id}, id=req.id)
-
+            return await _handle_ping(params, req.id)
         if method == "shutdown":
-            session_id = params.get("sessionId")
-            if isinstance(session_id, str):
-                ACTIVE_SESSIONS.pop(session_id, None)
-            return JsonRpcResponse(result={}, id=req.id)
-
+            return await _handle_shutdown(params, req.id)
         if method == "tools/list":
-            try:
-                _require_session(params)
-            except McpSessionError as exc:
-                return _json_rpc_error(exc.code, str(exc), data=exc.data, request_id=req.id)
-            result = {
-                "tools": [spec.as_mcp_dict() for spec in TOOLS.values()],
-                "nextCursor": None,
-            }
-            return JsonRpcResponse(result=result, id=req.id)
-
+            return await _handle_tools_list(params, req.id)
         if method == "tools/call":
-            try:
-                _require_session(params)
-            except McpSessionError as exc:
-                return _json_rpc_error(exc.code, str(exc), data=exc.data, request_id=req.id)
+            return await _handle_tools_call(params, req.id)
 
-            name = params.get("name")
-            arguments = params.get("arguments") or {}
-            if not isinstance(name, str) or name not in TOOL_HANDLERS:
-                return _json_rpc_error(
-                    -32601,
-                    "Tool not found",
-                    data={"available": list(TOOL_HANDLERS.keys())},
-                    request_id=req.id,
-                )
-            if not isinstance(arguments, dict):
-                return _json_rpc_error(
-                    -32602,
-                    "Invalid params: 'arguments' must be an object",
-                    request_id=req.id,
-                )
-            handler = TOOL_HANDLERS[name]
-            result = handler(arguments)
-            return JsonRpcResponse(result=result, id=req.id)
-
+        # Optional legacy methods support
         if ENABLE_LEGACY_METHODS and method in {"tools.echo", "tools.read_file"}:
-            legacy_arguments = params if isinstance(params, dict) else {}
-            if method == "tools.echo":
-                return JsonRpcResponse(
-                    result=_handle_echo(legacy_arguments),
-                    id=req.id,
-                )
-            if method == "tools.read_file":
-                return JsonRpcResponse(
-                    result=_handle_read_file(legacy_arguments),
-                    id=req.id,
-                )
+            return await _handle_legacy(params, method, req.id)
 
         return _json_rpc_error(
             -32601,
