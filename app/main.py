@@ -479,6 +479,48 @@ def _handle_read_file(arguments: Dict[str, Any]) -> ToolResponse:
     metadata = {"path": result["path"], "size": result["size"]}
     return _tool_ok(content=[{"type": "text", "text": result["text"]}], metadata=metadata)
 
+def _handle_think(arguments: Dict[str, Any]) -> ToolResponse:
+    if not THINK_TOOL_CONFIG.enabled:
+        return _tool_error("think-tool отключён в конфигурации.")
+    if THINK_TOOL_CLIENT is None:
+        return _tool_error("think-tool недоступен: клиент не инициализирован, проверьте логи.")
+
+    thought = arguments.get("thought")
+    if not isinstance(thought, str) or not thought.strip():
+        return _tool_error("Invalid params: 'thought' must be a non-empty string")
+    parent_trace = arguments.get("parent_trace_id")
+    if parent_trace is not None and not isinstance(parent_trace, str):
+        return _tool_error("Invalid params: 'parent_trace_id' must be a string")
+
+    try:
+        call_result = THINK_TOOL_CLIENT.capture_thought(thought, parent_trace)
+    except Exception as exc:  # pragma: no cover - сетевые ошибки фиксируются в логах
+        logger.exception("think-tool call failed")
+        return _tool_error(f"think-tool call failed: {exc}")
+
+    if call_result.skipped:
+        return _tool_error(call_result.error or "think-tool request skipped by client")
+    if not call_result.ok:
+        metadata = {"status_code": call_result.status_code} if call_result.status_code else None
+        return _tool_error(call_result.error or "think-tool returned error", metadata=metadata)
+
+    remote_result = call_result.result or {}
+    content: Optional[List[Dict[str, Any]]] = None
+    metadata: Dict[str, Any] = {"via": "think-tool"}
+
+    if isinstance(remote_result, dict):
+        remote_content = remote_result.get("content")
+        if isinstance(remote_content, list):
+            content = [item for item in remote_content if isinstance(item, dict)]
+        if remote_result:
+            metadata["remoteResult"] = remote_result
+
+    if content is None:
+        serialized = json.dumps(remote_result, ensure_ascii=False) if remote_result else "ok"
+        content = [{"type": "text", "text": serialized}]
+
+    return _tool_ok(content=content, metadata=metadata)
+
 
 # ---- Chat tool helpers to reduce cognitive complexity ----
 class _ChatArgError(ValueError):
@@ -583,6 +625,33 @@ TOOL_HANDLERS: Dict[str, ToolHandler] = {
     "read_file": _handle_read_file,
     "chat": _handle_chat,
 }
+
+if THINK_TOOL_CONFIG.enabled:
+    TOOLS["think"] = ToolSpec(
+        name="think",
+        description="Forward intermediate thoughts to the external think-tool service.",
+        input_schema=ToolSchema(
+            properties={
+                "thought": {
+                    "type": "string",
+                    "description": "Thought text to be persisted by think-tool.",
+                },
+                "parent_trace_id": {
+                    "type": "string",
+                    "description": "Optional LangSmith trace identifier.",
+                },
+            },
+            required=["thought"],
+        ),
+        output_schema=ToolSchema(
+            properties={
+                "content": {"type": "array", "description": "Stream-friendly response blocks."},
+                "metadata": {"type": "object", "description": "Additional context from think-tool."},
+                "isError": {"type": "boolean"},
+            },
+        ),
+    )
+    TOOL_HANDLERS["think"] = _handle_think
 
 
 # =========================
