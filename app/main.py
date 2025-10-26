@@ -382,6 +382,15 @@ def _normalise_responses_output(data: Dict[str, Any]) -> Tuple[List[Dict[str, An
 
     outputs = data.get("output") or data.get("outputs") or []
     for output in outputs:
+        if isinstance(output, str):
+            try:
+                output = json.loads(output)
+            except json.JSONDecodeError:
+                logger.debug("Skipping non-JSON output entry: %s", output)
+                continue
+        if not isinstance(output, dict):
+            continue
+
         output_type = output.get("type")
         if output_type == "message":
             for block in output.get("content", []):
@@ -392,6 +401,8 @@ def _normalise_responses_output(data: Dict[str, Any]) -> Tuple[List[Dict[str, An
                         content_blocks.append({"type": "text", "text": text})
                 elif block_type == "tool_call":
                     tool_calls.append(_convert_tool_call_block(block))
+        elif output_type in {"tool_call", "function_call"}:
+            tool_calls.append(_convert_tool_call_block(output))
         elif output_type in {"output_text", "text"}:
             text = output.get("text") or ""
             if text:
@@ -653,6 +664,41 @@ def _handle_chat(arguments: Dict[str, Any]) -> ToolResponse:
         content_blocks, tool_calls, meta = _normalise_chat_completion(response_data)
     if not content_blocks and not tool_calls and response_data:
         content_blocks = [{"type": "text", "text": json.dumps(response_data)}]
+
+    executed_think_content: List[Dict[str, Any]] = []
+    executed_think_metadata: List[Dict[str, Any]] = []
+    remaining_tool_calls: List[Dict[str, Any]] = []
+
+    for call in tool_calls:
+        if call.get("toolName") != "think":
+            remaining_tool_calls.append(call)
+            continue
+
+        arguments = call.get("arguments") or {}
+        if not isinstance(arguments, dict):
+            arguments = {"raw": arguments}
+
+        think_result = _handle_think(arguments)
+        if think_result.get("isError"):
+            error_blocks = think_result.get("content") or [{"type": "text", "text": "think-tool returned error"}]
+            executed_think_content.extend(
+                block for block in error_blocks if isinstance(block, dict)
+            )
+        else:
+            executed_think_content.extend(
+                block for block in (think_result.get("content") or []) if isinstance(block, dict)
+            )
+        metadata = think_result.get("metadata")
+        if metadata:
+            executed_think_metadata.append(metadata)
+
+    if executed_think_content:
+        content_blocks.extend(executed_think_content)
+    tool_calls = remaining_tool_calls
+    if executed_think_metadata:
+        meta = meta or {}
+        meta["thinkTool"] = executed_think_metadata
+
     return _tool_ok(content=content_blocks, tool_calls=tool_calls, metadata=meta or None)
 
 
