@@ -498,30 +498,29 @@ def _handle_read_file(arguments: Dict[str, Any]) -> ToolResponse:
 
 def _handle_think(arguments: Dict[str, Any]) -> ToolResponse:
     if not THINK_TOOL_CONFIG.enabled:
-        print("[debug] _handle_think: THINK_TOOL_CONFIG.enabled is False")
+        logger.debug("think-tool disabled in configuration")
         return _tool_error("think-tool отключён в конфигурации.")
     if THINK_TOOL_CLIENT is None:
-        print("[debug] _handle_think: THINK_TOOL_CLIENT is None")
+        logger.debug("think-tool client not initialised")
         return _tool_error("think-tool недоступен: клиент не инициализирован, проверьте логи.")
 
-    print("[debug] _handle_think: incoming arguments", arguments)
+    logger.debug("_handle_think arguments: %s", arguments)
     thought = arguments.get("thought")
     if not isinstance(thought, str) or not thought.strip():
-        print("[debug] _handle_think: invalid thought", thought)
+        logger.debug("Invalid think 'thought': %s", thought)
         return _tool_error("Invalid params: 'thought' must be a non-empty string")
     parent_trace = arguments.get("parent_trace_id")
     if parent_trace is not None and not isinstance(parent_trace, str):
-        print("[debug] _handle_think: invalid parent_trace_id", parent_trace)
+        logger.debug("Invalid think parent_trace_id: %s", parent_trace)
         return _tool_error("Invalid params: 'parent_trace_id' must be a string")
 
     try:
         call_result = THINK_TOOL_CLIENT.capture_thought(thought, parent_trace)
     except Exception as exc:  # pragma: no cover - сетевые ошибки фиксируются в логах
         logger.exception("think-tool call failed")
-        print("[debug] _handle_think: exception", exc)
         return _tool_error(f"think-tool call failed: {exc}")
 
-    print("[debug] _handle_think: call_result", call_result)
+    logger.debug("think-tool call result: %s", call_result)
     if call_result.was_skipped:
         return _tool_error(call_result.error or "think-tool request skipped by client")
     if not call_result.ok:

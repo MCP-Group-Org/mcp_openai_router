@@ -98,23 +98,22 @@ class ThinkToolClient:
 
     def capture_thought(self, thought: str, parent_trace_id: Optional[str] = None) -> ThinkCallResult:
         """Отправить мысль в think-tool. Возвращает нормализованный ответ."""
-        print("[debug] capture_thought: enabled=", self._config.enabled, "url=", self._config.url)
-        print("[debug] capture_thought: thought=", thought)
-        print("[debug] capture_thought: parent_trace_id=", parent_trace_id)
+        logger.debug("capture_thought enabled=%s url=%s", self._config.enabled, self._config.url)
+        logger.debug("capture_thought thought=%s", thought)
+        logger.debug("capture_thought parent_trace_id=%s", parent_trace_id)
         if not self._config.enabled:
-            print("[debug] capture_thought: skipped because disabled config")
+            logger.debug("capture_thought skipped (disabled config)")
             return ThinkCallResult.skipped("think-tool отключён конфигурацией.")
         if not thought.strip():
-            print("[debug] capture_thought: skipped because empty thought")
+            logger.debug("capture_thought skipped (empty thought)")
             return ThinkCallResult.skipped("передана пустая мысль.")
 
         try:
-            print("[debug] capture_thought: ensuring initialized, current session:", self._session_id)
+            logger.debug("capture_thought ensure initialised, session=%s", self._session_id)
             self._ensure_initialized()
-            print("[debug] capture_thought: ensure_initialized done, session:", self._session_id)
+            logger.debug("capture_thought initialised, session=%s", self._session_id)
         except Exception as exc:  # pragma: no cover - реальная сеть недоступна в тестах
             logger.warning("Не удалось выполнить handshake с think-tool: %s", exc)
-            print("[debug] capture_thought: ensure_initialized exception", exc)
             return ThinkCallResult(ok=False, error=str(exc))
 
         payload = {
@@ -132,25 +131,24 @@ class ThinkToolClient:
         }
 
         try:
-            print("[debug] capture_thought: sending payload", payload)
+            logger.debug("capture_thought sending payload=%s", payload)
             response, status_code = self._post(payload, allow_error=False)
-            print("[debug] capture_thought: response status", status_code, "body", response)
+            logger.debug("capture_thought response status=%s body=%s", status_code, response)
         except Exception as exc:  # pragma: no cover - проксируется в лог, в тестах отрабатываем моком
             logger.warning("Ошибка обращения к think-tool: %s", exc)
-            print("[debug] capture_thought: _post exception", exc)
             return ThinkCallResult(ok=False, error=str(exc))
 
         if not response:
-            print("[debug] capture_thought: empty response from think-tool")
+            logger.debug("capture_thought empty response")
             return ThinkCallResult(ok=False, error="пустой ответ от think-tool", status_code=status_code)
 
         error_obj = response.get("error")
         if error_obj:
             message = error_obj.get("message") or "think-tool вернул ошибку"
-            print("[debug] capture_thought: error object", error_obj)
+            logger.debug("capture_thought error object=%s", error_obj)
             return ThinkCallResult(ok=False, error=message, status_code=status_code, result=error_obj)
 
-        print("[debug] capture_thought: success result", response.get("result"))
+        logger.debug("capture_thought success result=%s", response.get("result"))
         return ThinkCallResult(
             ok=True,
             result=response.get("result"),
@@ -161,21 +159,21 @@ class ThinkToolClient:
 
     def _ensure_initialized(self) -> None:
         if self._initialized:
-            print("[debug] _ensure_initialized: already initialized with session", self._session_id)
+            logger.debug("_ensure_initialized already initialised session=%s", self._session_id)
             return
-        print("[debug] _ensure_initialized: start")
+        logger.debug("_ensure_initialized start")
         self._ensure_session()
         self._send_initialize()
         self._send_initialized_notification()
         self._initialized = True
-        print("[debug] _ensure_initialized: done with session", self._session_id)
+        logger.debug("_ensure_initialized done session=%s", self._session_id)
 
     def _ensure_session(self) -> None:
         if self._session_id:
-            print("[debug] _ensure_session: existing session", self._session_id)
+            logger.debug("_ensure_session existing session=%s", self._session_id)
             return
 
-        print("[debug] _ensure_session: requesting session via ping")
+        logger.debug("_ensure_session requesting session via ping")
         payload = {
             "jsonrpc": "2.0",
             "id": f"ping-{uuid4().hex}",
@@ -184,7 +182,7 @@ class ThinkToolClient:
         }
 
         response, _ = self._post(payload, include_session=False, allow_error=True)
-        print("[debug] _ensure_session: ping response", response)
+        logger.debug("_ensure_session ping response=%s", response)
         session_id = None
         if response and isinstance(response, dict):
             # Некоторые реализации могут возвращать sessionId в результате.
@@ -193,14 +191,14 @@ class ThinkToolClient:
             session_id = self._session_id
 
         if not session_id:
-            print("[debug] _ensure_session: server did not provide session id")
+            logger.debug("_ensure_session server did not provide session id")
             raise RuntimeError("Сервер think-tool не вернул session ID.")
 
         self._session_id = session_id
-        print("[debug] _ensure_session: new session", self._session_id)
+        logger.debug("_ensure_session new session=%s", self._session_id)
 
     def _send_initialize(self) -> None:
-        print("[debug] _send_initialize: session", self._session_id)
+        logger.debug("_send_initialize session=%s", self._session_id)
         payload = {
             "jsonrpc": "2.0",
             "id": f"init-{uuid4().hex}",
@@ -212,17 +210,17 @@ class ThinkToolClient:
             },
         }
         response, status = self._post(payload, allow_error=False)
-        print("[debug] _send_initialize: status", status, "response", response)
+        logger.debug("_send_initialize status=%s response=%s", status, response)
 
     def _send_initialized_notification(self) -> None:
-        print("[debug] _send_initialized_notification: session", self._session_id)
+        logger.debug("_send_initialized_notification session=%s", self._session_id)
         payload = {
             "jsonrpc": "2.0",
             "method": "notifications/initialized",
             "params": {},
         }
         response, status = self._post(payload, allow_error=False)
-        print("[debug] _send_initialized_notification: status", status, "response", response)
+        logger.debug("_send_initialized_notification status=%s response=%s", status, response)
 
     def _post(
         self,
@@ -244,31 +242,31 @@ class ThinkToolClient:
 
         for _ in range(attempts):
             try:
-                print("[debug] _post: sending", payload, "headers", headers)
+                logger.debug("_post sending payload=%s headers=%s", payload, headers)
                 response = self._client.post(self._config.url, json=payload, headers=headers)
             except Exception as exc:  # pragma: no cover - реальный сетевой сбой
                 last_exc = exc
-                print("[debug] _post: exception", exc)
+                logger.debug("_post exception=%s", exc)
                 continue
 
             session_id = response.headers.get(_SESSION_HEADER)
             if session_id:
                 self._session_id = session_id
-                print("[debug] _post: updated session from headers", self._session_id)
+                logger.debug("_post updated session from headers=%s", self._session_id)
 
             if not allow_error and response.status_code >= 400:
                 # Собираем тело для диагностики.
                 parsed = self._parse_response(response)
                 detail = parsed.get("error") if isinstance(parsed, dict) else parsed
-                print("[debug] _post: error status", response.status_code, "parsed", parsed)
+                logger.debug("_post error status=%s parsed=%s", response.status_code, parsed)
                 raise RuntimeError(f"think-tool вернул {response.status_code}: {detail}")
 
             parsed = self._parse_response(response)
-            print("[debug] _post: parsed response", parsed)
+            logger.debug("_post parsed response=%s", parsed)
             return parsed, response.status_code
 
         if last_exc:
-            print("[debug] _post: raising last exception", last_exc)
+            logger.debug("_post raising last exception=%s", last_exc)
             raise last_exc
 
         raise RuntimeError("Неизвестная ошибка think-tool (нет ответа).")
