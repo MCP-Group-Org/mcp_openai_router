@@ -20,6 +20,14 @@ from fastapi import FastAPI
 from pydantic import BaseModel, Field, ValidationError
 
 from .think_client import ThinkToolClient, ThinkToolConfig, create_think_tool_client  # think-tool: конфиг+клиент
+from .models.json_rpc import (
+    InitializeParams,
+    JsonRpcError,
+    JsonRpcErrorObj,
+    JsonRpcRequest,
+    JsonRpcResponse,
+    SessionState,
+)
 
 try:
     # Optional runtime dependency; in tests we patch the factory instead.
@@ -36,45 +44,6 @@ if not logger.handlers:
 # FastAPI app
 # =========================
 app = FastAPI(title="MCP - OpenAI Router", version="0.0.2")
-
-
-# -------- JSON-RPC 2.0 models --------
-class JsonRpcRequest(BaseModel):
-    jsonrpc: Literal["2.0"] = "2.0"
-    method: str
-    params: Optional[Dict[str, Any]] = None
-    id: Optional[Any] = None
-
-
-class JsonRpcResponse(BaseModel):
-    jsonrpc: Literal["2.0"] = "2.0"
-    result: Any = None
-    id: Optional[Any] = None
-
-
-class JsonRpcErrorObj(BaseModel):
-    code: int
-    message: str
-    data: Optional[Any] = None
-
-
-class JsonRpcError(BaseModel):
-    jsonrpc: Literal["2.0"] = "2.0"
-    error: JsonRpcErrorObj
-    id: Optional[Any] = None
-
-
-# -------- MCP models --------
-class InitializeParams(BaseModel):
-    protocolVersion: Optional[str] = None
-    clientInfo: Dict[str, Any] = Field(default_factory=dict)
-    capabilities: Dict[str, Any] = Field(default_factory=dict)
-
-
-class SessionState(BaseModel):
-    id: str
-    client_info: Dict[str, Any] = Field(default_factory=dict)
-    capabilities: Dict[str, Any] = Field(default_factory=dict)
 
 
 # =========================
