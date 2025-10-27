@@ -19,7 +19,7 @@
 - [x] Перенести JSON-RPC и сессионные модели в `app/models/json_rpc.py`, обновить импорты.
 - [ ] Пауза на пользовательскую проверку: `python -m pytest tests/test_mcp_router.py::test_initialize`.
 - [ ] Пауза на пользовательскую проверку: `jupyter-notebook` `/Users/romankassymov/python_web/jupyter-diagnostic/notebooks/mcp-openai-router/mor-python.ipynb`, telegramm bot Xaia..
-- [ ] Вынести константы, фичефлаги и глобальные объекты (`PROTOCOL_VERSION`, `SERVER_CAPABILITIES`, `ACTIVE_SESSIONS`, конфиг think-tool) в `app/core/config.py` и `app/core/session.py`.
+- [x] Вынести константы, фичефлаги и глобальные объекты (`PROTOCOL_VERSION`, `SERVER_CAPABILITIES`, `ACTIVE_SESSIONS`, конфиг think-tool) в `app/core/config.py` и `app/core/session.py`.
 - [ ] Пауза на пользовательскую проверку: `python -m pytest tests/test_mcp_router.py::test_tools_list`.
 - [ ] Пауза на пользовательскую проверку: `jupyter-notebook` `/Users/romankassymov/python_web/jupyter-diagnostic/notebooks/mcp-openai-router/mor-python.ipynb`, telegramm bot Xaia..
 - [ ] Переместить описание схем, спецификаций инструментов и словарь `TOOLS` в `app/tools/registry.py`; обработчики (`_handle_echo`, `_handle_read_file`, `_handle_think`) в `app/tools/handlers.py`.

@@ -9,9 +9,7 @@ from __future__ import annotations
 import json
 import logging
 import os
-import sys
 import time
-from threading import Semaphore
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple, Literal
 from uuid import uuid4
@@ -19,7 +17,6 @@ from uuid import uuid4
 from fastapi import FastAPI
 from pydantic import BaseModel, Field, ValidationError
 
-from .think_client import ThinkToolClient, ThinkToolConfig, create_think_tool_client  # think-tool: конфиг+клиент
 from .models.json_rpc import (
     InitializeParams,
     JsonRpcError,
@@ -28,6 +25,18 @@ from .models.json_rpc import (
     JsonRpcResponse,
     SessionState,
 )
+from .core.config import (
+    BASE_DIR,
+    ENABLE_LEGACY_METHODS,
+    POLL_SEM,
+    PROTOCOL_VERSION,
+    REQUIRE_SESSION,
+    SERVER_CAPABILITIES,
+    SERVER_INFO,
+    THINK_TOOL_CLIENT,
+    THINK_TOOL_CONFIG,
+)
+from .core.session import ACTIVE_SESSIONS
 
 try:
     # Optional runtime dependency; in tests we patch the factory instead.
@@ -44,40 +53,6 @@ if not logger.handlers:
 # FastAPI app
 # =========================
 app = FastAPI(title="MCP - OpenAI Router", version="0.0.2")
-
-
-# =========================
-# Constants and feature flags
-# =========================
-PROTOCOL_VERSION = "1.0"
-SERVER_INFO = {
-    "name": "mcp-openai-router",
-    "version": os.getenv("APP_VERSION", "0.0.2"),
-}
-SERVER_CAPABILITIES = {
-    "tools": {
-        "listChangedNotification": False,
-        "parallelCalls": True,
-    },
-    "sampling": {
-        "supportsHostedTools": True,
-    },
-}
-ENABLE_LEGACY_METHODS = (
-    "--legacy" in sys.argv
-    or os.getenv("MCP_ENABLE_LEGACY", "").lower() in {"1", "true", "yes"}
-)
-BASE_DIR = Path("/app").resolve()
-ACTIVE_SESSIONS: Dict[str, SessionState] = {}
-REQUIRE_SESSION = os.getenv("MCP_REQUIRE_SESSION", "1").strip().lower() in {"1", "true", "yes", "on"}
-
-# Limit concurrent polling requests to avoid exhausting the HTTP connection pool
-RESPONSES_POLL_MAX_CONCURRENCY = int(os.getenv("RESPONSES_POLL_MAX_CONCURRENCY", "8"))
-POLL_SEM = Semaphore(max(1, RESPONSES_POLL_MAX_CONCURRENCY))
-
-# think-tool: фиксируем настройки/клиент на уровне модуля, чтобы переиспользовать внутри обработчиков
-THINK_TOOL_CONFIG = ThinkToolConfig.from_env()
-THINK_TOOL_CLIENT: Optional[ThinkToolClient] = create_think_tool_client(THINK_TOOL_CONFIG)
 
 
 # =========================
