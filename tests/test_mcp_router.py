@@ -146,6 +146,26 @@ def test_initialize_list_and_chat(monkeypatch: pytest.MonkeyPatch) -> None:
     assert dummy_client.responses.last_request["input"][0]["role"] == "system"
 
 
+def test_chat_returns_error_when_responses_api_missing(monkeypatch: pytest.MonkeyPatch) -> None:
+    class BrokenClient:
+        pass
+
+    monkeypatch.setattr(mcp, "_create_openai_client", lambda: BrokenClient())
+
+    result = mcp._handle_chat(
+        {
+            "model": "gpt-error",
+            "messages": [
+                {"role": "system", "content": "Test"},
+                {"role": "user", "content": "Hello"},
+            ],
+        }
+    )
+
+    assert result["isError"] is True
+    assert "Responses API" in result["content"][0]["text"]
+
+
 def test_chat_handles_think_function_call(monkeypatch: pytest.MonkeyPatch) -> None:
     think_call_id = "call_think_42"
     initial_payload = {

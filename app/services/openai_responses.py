@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import os
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 logger = logging.getLogger("mcp_openai_router.services.openai_responses")
 
@@ -25,6 +25,58 @@ def create_openai_client() -> Any:
         raise RuntimeError("Missing OPENAI_API_KEY env var")
     base_url = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
     return OpenAI(api_key=api_key, base_url=base_url)
+
+
+class OpenAIClientAdapter:
+    """Инкапсулирует фабрику клиента OpenAI и доступ к Responses API."""
+
+    def __init__(self, client_factory: Optional[Callable[[], Any]] = None) -> None:
+        self._client_factory = client_factory or create_openai_client
+        self._client: Optional[Any] = None
+        self._create_fn: Optional[Callable[..., Any]] = None
+        self._retrieve_fn: Optional[Callable[..., Any]] = None
+
+    def ensure_ready(self) -> None:
+        """Ленивая инициализация клиента и проверка доступности Responses API."""
+        if self._client is not None and self._create_fn is not None:
+            return
+
+        client = self._client_factory()
+        responses_api = getattr(client, "responses", None)
+        if responses_api is None:
+            raise RuntimeError("OpenAI client missing Responses API.")
+
+        create_fn = getattr(responses_api, "create", None)
+        if not callable(create_fn):
+            raise RuntimeError("OpenAI client does not expose responses.create; update the SDK.")
+
+        retrieve_candidate = getattr(responses_api, "retrieve", None)
+        retrieve_fn = retrieve_candidate if callable(retrieve_candidate) else None
+
+        self._client = client
+        self._create_fn = create_fn
+        self._retrieve_fn = retrieve_fn
+
+    def create_response(self, payload: Dict[str, Any]) -> Any:
+        """Создаёт ответ через Responses API."""
+        self.ensure_ready()
+        assert self._create_fn is not None
+        return self._create_fn(**payload)
+
+    def retrieve_response(self, response_id: str) -> Any:
+        """Получает ответ по идентификатору, если доступен метод retrieve."""
+        self.ensure_ready()
+        if self._retrieve_fn is None:
+            return None
+        try:
+            return self._retrieve_fn(response_id=response_id)
+        except TypeError:
+            return self._retrieve_fn(id=response_id)  # type: ignore[call-arg]
+
+    def can_retrieve(self) -> bool:
+        """Проверяет, доступен ли метод retrieve у Responses API."""
+        self.ensure_ready()
+        return self._retrieve_fn is not None
 
 
 def maybe_model_dump(value: Any) -> Dict[str, Any]:

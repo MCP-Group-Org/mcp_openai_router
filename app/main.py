@@ -31,6 +31,7 @@ from .tools.handlers import _handle_echo, _handle_read_file, _handle_think, _too
 from .tools.registry import ToolHandler, ToolResponse, ToolSchema, ToolSpec, TOOLS
 from .services.openai_responses import (
     ChatArgError,
+    OpenAIClientAdapter,
     build_request_payload,
     create_openai_client,
     extract_chat_params,
@@ -84,11 +85,12 @@ def _handle_chat(arguments: Dict[str, Any]) -> ToolResponse:
     except ChatArgError as exc:
         return _tool_error(str(exc))
 
-    # 2) Создание клиента OpenAI.
-    # Обернули в тонкую функцию _create_openai_client ради тестов/monkeypatch.
-    # Исключения транслируем в человекочитаемую ошибку инструмента.
+    # 2) Создание адаптера клиента OpenAI.
+    # _create_openai_client оставлен для тестов/monkeypatch; адаптер добавляет
+    # ленивую инициализацию и проверку Responses API.
     try:
-        client = _create_openai_client()
+        client_adapter = OpenAIClientAdapter(client_factory=_create_openai_client)
+        client_adapter.ensure_ready()
     except RuntimeError as exc:
         return _tool_error(str(exc))
 
@@ -98,27 +100,15 @@ def _handle_chat(arguments: Dict[str, Any]) -> ToolResponse:
     # и конфигурацию think-инструмента, если это включено.
     request_payload = build_request_payload(params, input_messages, ensure_think_tool=THINK_TOOL_CONFIG.enabled)
 
-    # 4) Дефенсивная проверка: у клиента должен быть раздел responses и метод create.
-    # Мы не привязываемся жёстко к конкретному SDK: getattr позволяет безопасно
-    # проверить наличие возможностей без падения при несовместимой версии.
-    responses_api = getattr(client, "responses", None)
-    if responses_api is None:
-        return _tool_error("OpenAI client missing Responses API.")
-
-    create_fn = getattr(responses_api, "create", None)
-    if not callable(create_fn):
-        return _tool_error("OpenAI client does not expose responses.create; update the SDK.")
-
-    # Не все SDK поддерживают retrieve (получение статуса по id). Если нет —
-    # мы сможем вернуть начальный ответ без активного опроса.
-    retrieve_fn = getattr(responses_api, "retrieve", None)
+    # 4) Проверяем доступность responses.retrieve — пригодится при поллинге.
+    supports_retrieve = client_adapter.can_retrieve()
 
     # 5) Инициализирующий запрос к Responses API.
     # Засекаем время ради логов и диагностик. Любая сетевая ошибка переводится
     # в ToolResponse c ошибкой — это позволит корректно отобразить её на стороне MCP-клиента.
     try:
         t0 = time.time()
-        initial_response = create_fn(**request_payload)
+        initial_response = client_adapter.create_response(request_payload)
         dt = (time.time() - t0) * 1000.0
         logger.info("responses.create ok in %.1f ms (model=%s, tools=%s)", dt, params["model"], bool(request_payload.get("tools")))
         response_data = _maybe_model_dump(initial_response)
@@ -136,7 +126,7 @@ def _handle_chat(arguments: Dict[str, Any]) -> ToolResponse:
     # Используется, когда первоначальный статус — queued/in_progress, или когда
     # SDK вернул ответ без финального статуса. Реализуем аккуратный поллинг.
     def _poll_response(response_id: str, initial: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-        if not callable(retrieve_fn):
+        if not supports_retrieve:
             return initial or {}
         # Ограничиваем параллельный поллинг через семафор POLL_SEM, чтобы не исчерпать
         # соединения/ресурсы клиента при массовых одновременных запросах.
@@ -156,9 +146,10 @@ def _handle_chat(arguments: Dict[str, Any]) -> ToolResponse:
             while polls < max_polls:
                 t0 = time.time()
                 try:
-                    retrieved = retrieve_fn(response_id=response_id)
-                except TypeError:
-                    retrieved = retrieve_fn(id=response_id)  # type: ignore[call-arg]
+                    retrieved = client_adapter.retrieve_response(response_id)
+                except Exception as exc:  # pragma: no cover - сеть/SDK
+                    logger.warning("responses.retrieve failed: %s", exc)
+                    break
                 dt = (time.time() - t0) * 1000.0
                 if not retrieved:
                     logger.info("responses.retrieve empty in %.1f ms (poll=%d)", dt, polls)
@@ -190,7 +181,7 @@ def _handle_chat(arguments: Dict[str, Any]) -> ToolResponse:
             return payload
         if status in {"queued", "in_progress"}:
             return _poll_response(response_id, payload)
-        if status is None and callable(retrieve_fn):
+        if status is None and supports_retrieve:
             return _poll_response(response_id, payload)
         return payload
 
@@ -345,7 +336,7 @@ def _handle_chat(arguments: Dict[str, Any]) -> ToolResponse:
 
             logger.info("Sending OpenAI follow-up: %s", follow_up_payload)
             t1 = time.time()
-            follow_up = create_fn(**follow_up_payload)
+            follow_up = client_adapter.create_response(follow_up_payload)
             dt1 = (time.time() - t1) * 1000.0
             logger.info("responses.create (follow-up) ok in %.1f ms", dt1)
             follow_up_data = _resolve_response(_maybe_model_dump(follow_up))
