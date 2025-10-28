@@ -8,9 +8,8 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 from uuid import uuid4
 
 from fastapi import FastAPI
@@ -36,17 +35,31 @@ from .core.config import (
 from .core.session import ACTIVE_SESSIONS
 from .tools.handlers import _handle_echo, _handle_read_file, _handle_think, _tool_error, _tool_ok
 from .tools.registry import ToolHandler, ToolResponse, ToolSchema, ToolSpec, TOOLS
-
-try:
-    # Optional runtime dependency; in tests we patch the factory instead.
-    from openai import OpenAI
-except Exception:  # pragma: no cover
-    OpenAI = None  # type: ignore[assignment]
+from .services.openai_responses import (
+    ChatArgError,
+    build_request_payload,
+    create_openai_client,
+    extract_chat_params,
+    maybe_model_dump,
+    normalise_chat_completion,
+    normalise_responses_output,
+    normalize_input_messages,
+)
+from .think_client import ThinkToolConfig
 
 
 logger = logging.getLogger("mcp_openai_router")
 if not logger.handlers:
     logging.basicConfig(level=logging.INFO)
+
+
+# Тонкие обёртки сохранены ради тестов, которые monkeypatch по именам внутри app.main.
+def _create_openai_client() -> Any:
+    return create_openai_client()
+
+
+def _maybe_model_dump(value: Any) -> Dict[str, Any]:
+    return maybe_model_dump(value)
 
 # =========================
 # FastAPI app
@@ -98,244 +111,12 @@ def _require_session(params: Dict[str, Any]) -> SessionState:
     return session
 
 
-def _create_openai_client() -> Any:
-    if OpenAI is None:
-        raise RuntimeError("OpenAI SDK not available. Install the 'openai' package.")
-    api_key = os.getenv("OPENAI_API_KEY")
-    if not api_key:
-        raise RuntimeError("Missing OPENAI_API_KEY env var")
-    base_url = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
-    return OpenAI(api_key=api_key, base_url=base_url)
-
-
-def _maybe_model_dump(value: Any) -> Dict[str, Any]:
-    if value is None:
-        return {}
-    if hasattr(value, "model_dump") and callable(value.model_dump):
-        return value.model_dump()
-    if hasattr(value, "dict") and callable(value.dict):
-        return value.dict()  # type: ignore[return-value]
-    if isinstance(value, dict):
-        return value
-    try:
-        return json.loads(value)  # type: ignore[arg-type]
-    except Exception:
-        return {}
-
-
-def _convert_tool_call_block(block: Dict[str, Any]) -> Dict[str, Any]:
-    arguments = block.get("arguments")
-    if isinstance(arguments, str):
-        try:
-            arguments = json.loads(arguments)
-        except json.JSONDecodeError:
-            arguments = {"raw": arguments}
-    elif arguments is None:
-        arguments = {}
-    return {
-        "id": block.get("call_id") or block.get("id") or block.get("tool_call_id"),
-        "toolName": block.get("name") or block.get("tool_name"),
-        "arguments": arguments,
-    }
-
-
-def _normalise_responses_output(data: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], Dict[str, Any]]:
-    content_blocks: List[Dict[str, Any]] = []
-    tool_calls: List[Dict[str, Any]] = []
-
-    outputs = data.get("output") or data.get("outputs") or []
-    for output in outputs:
-        if isinstance(output, str):
-            try:
-                output = json.loads(output)
-            except json.JSONDecodeError:
-                logger.debug("Skipping non-JSON output entry: %s", output)
-                continue
-        if not isinstance(output, dict):
-            continue
-
-        output_type = output.get("type")
-        if output_type == "message":
-            for block in output.get("content", []):
-                block_type = block.get("type")
-                if block_type in {"output_text", "text", "input_text"}:
-                    text = block.get("text") or block.get("value") or ""
-                    if text:
-                        content_blocks.append({"type": "text", "text": text})
-                elif block_type in {"tool_call", "function_call"}:
-                    tool_calls.append(_convert_tool_call_block(block))
-        elif output_type in {"tool_call", "function_call"}:
-            tool_calls.append(_convert_tool_call_block(output))
-        elif output_type in {"output_text", "text"}:
-            text = output.get("text") or ""
-            if text:
-                content_blocks.append({"type": "text", "text": text})
-
-    usage = data.get("usage") or {}
-    finish_reason = data.get("status") or data.get("finish_reason")
-    metadata: Dict[str, Any] = {}
-    if usage:
-        metadata["usage"] = usage
-    if finish_reason:
-        metadata["finishReason"] = finish_reason
-    if data.get("id"):
-        metadata["responseId"] = data["id"]
-    return content_blocks, tool_calls, metadata
-
-
-def _normalise_chat_completion(data: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], Dict[str, Any]]:
-    content_blocks: List[Dict[str, Any]] = []
-    tool_calls: List[Dict[str, Any]] = []
-    metadata: Dict[str, Any] = {}
-
-    choices = data.get("choices") or []
-    if not choices:
-        return content_blocks, tool_calls, metadata
-
-    first = choices[0]
-    message = first.get("message") or {}
-    content = message.get("content")
-    if isinstance(content, list):
-        for item in content:
-            if isinstance(item, dict) and item.get("type") == "text":
-                text = item.get("text")
-                if text:
-                    content_blocks.append({"type": "text", "text": text})
-    elif isinstance(content, str) and content:
-        content_blocks.append({"type": "text", "text": content})
-
-    for call in message.get("tool_calls") or []:
-        function = call.get("function") or {}
-        arguments = function.get("arguments")
-        if isinstance(arguments, str):
-            try:
-                arguments = json.loads(arguments)
-            except json.JSONDecodeError:
-                arguments = {"raw": arguments}
-        tool_calls.append(
-            {
-                "id": call.get("id"),
-                "toolName": function.get("name") or call.get("type"),
-                "arguments": arguments or {},
-            }
-        )
-
-    usage = data.get("usage") or {}
-    finish_reason = first.get("finish_reason")
-    if usage:
-        metadata["usage"] = usage
-    if finish_reason:
-        metadata["finishReason"] = finish_reason
-    if data.get("id"):
-        metadata["responseId"] = data["id"]
-    return content_blocks, tool_calls, metadata
-
-
 # ---- Chat tool helpers to reduce cognitive complexity ----
-class _ChatArgError(ValueError):
-    pass
-
-
-def _extract_chat_params(arguments: Dict[str, Any]) -> Dict[str, Any]:
-    model = arguments.get("model")
-    messages = arguments.get("messages")
-    if not isinstance(model, str):
-        raise _ChatArgError("Invalid params: 'model' must be a string")
-    if not isinstance(messages, list):
-        raise _ChatArgError("Invalid params: 'messages' must be an array")
-
-    return {
-        "model": model,
-        "messages": messages,
-        "temperature": float(arguments.get("temperature", 0.7)),
-        "top_p": arguments.get("top_p"),
-        "max_tokens": arguments.get("max_tokens"),
-        "metadata": arguments.get("metadata"),
-        "parallel_tool_calls": arguments.get("parallelToolCalls"),
-        "tools": arguments.get("tools"),
-        "tool_choice": arguments.get("tool_choice") or arguments.get("toolChoice"),
-    }
-
-
-def _normalize_input_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    cleaned_messages: List[Dict[str, Any]] = []
-    for msg in messages:
-        if not isinstance(msg, dict):
-            raise _ChatArgError("Invalid params: every message must be an object")
-        role = msg.get("role")
-        content = msg.get("content")
-        if not isinstance(role, str):
-            raise _ChatArgError("Invalid params: message role must be a string")
-        if isinstance(content, list):
-            cleaned = [item for item in content if isinstance(item, dict)]
-            cleaned_messages.append({"role": role, "content": cleaned})
-        else:
-            cleaned_messages.append({"role": role, "content": content})
-    return cleaned_messages
-
-
-def _build_request_payload(params: Dict[str, Any], input_messages: List[Dict[str, Any]]) -> Dict[str, Any]:
-    payload: Dict[str, Any] = {
-        "model": params["model"],
-        "input": input_messages,
-        "temperature": params["temperature"],
-    }
-    tools_param = params.get("tools")
-    tools: List[Dict[str, Any]] | None = None
-    if isinstance(tools_param, list):
-        tools = [item for item in tools_param if isinstance(item, dict)]
-        if tools:
-            payload["tools"] = tools
-    if params.get("metadata"):
-        payload["metadata"] = params["metadata"]
-    if params.get("top_p") is not None:
-        payload["top_p"] = float(params["top_p"])  # type: ignore[arg-type]
-    if params.get("max_tokens") is not None:
-        payload["max_output_tokens"] = int(params["max_tokens"])  # type: ignore[arg-type]
-    if params.get("parallel_tool_calls") is not None:
-        payload["parallel_tool_calls"] = bool(params["parallel_tool_calls"])  # type: ignore[arg-type]
-    if params.get("tool_choice") is not None:
-        payload["tool_choice"] = params["tool_choice"]
-
-    if THINK_TOOL_CONFIG.enabled:
-        think_entry = {
-            "type": "function",
-            "name": "think",
-            "description": "Capture intermediate reasoning using the external think-tool.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "thought": {
-                        "type": "string",
-                        "description": "Thought text to be persisted by think-tool.",
-                    },
-                    "parent_trace_id": {
-                        "type": "string",
-                        "description": "Optional LangSmith trace identifier.",
-                    },
-                },
-                "required": ["thought"],
-                "additionalProperties": False,
-            },
-        }
-        tools_list = payload.setdefault("tools", tools or [])
-        # Avoid дублирования, если клиент уже передал think.
-        already_present = any(
-            isinstance(entry, dict)
-            and (entry.get("function") or {}).get("name") == "think"
-            for entry in tools_list
-        )
-        if not already_present:
-            tools_list.append(think_entry)
-
-    return payload
-
-
 def _handle_chat(arguments: Dict[str, Any]) -> ToolResponse:
     try:
-        params = _extract_chat_params(arguments)
-        input_messages = _normalize_input_messages(params["messages"])  # type: ignore[arg-type]
-    except _ChatArgError as exc:
+        params = extract_chat_params(arguments)
+        input_messages = normalize_input_messages(params["messages"])  # type: ignore[arg-type]
+    except ChatArgError as exc:
         return _tool_error(str(exc))
 
     try:
@@ -343,7 +124,7 @@ def _handle_chat(arguments: Dict[str, Any]) -> ToolResponse:
     except RuntimeError as exc:
         return _tool_error(str(exc))
 
-    request_payload = _build_request_payload(params, input_messages)
+    request_payload = build_request_payload(params, input_messages, ensure_think_tool=THINK_TOOL_CONFIG.enabled)
 
     responses_api = getattr(client, "responses", None)
     if responses_api is None:
@@ -442,9 +223,9 @@ def _handle_chat(arguments: Dict[str, Any]) -> ToolResponse:
     while turn < max_turns:
         turn += 1
 
-        content_blocks, tool_calls, meta = _normalise_responses_output(follow_up_data)
+        content_blocks, tool_calls, meta = normalise_responses_output(follow_up_data)
         if not content_blocks and not tool_calls:
-            content_blocks, tool_calls, meta = _normalise_chat_completion(follow_up_data)
+            content_blocks, tool_calls, meta = normalise_chat_completion(follow_up_data)
         if not content_blocks and not tool_calls and follow_up_data:
             content_blocks = [{"type": "text", "text": json.dumps(follow_up_data)}]
 

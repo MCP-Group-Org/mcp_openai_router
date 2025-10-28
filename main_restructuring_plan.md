@@ -25,7 +25,7 @@
 - [x] Переместить описание схем, спецификаций инструментов и словарь `TOOLS` в `app/tools/registry.py`; обработчики (`_handle_echo`, `_handle_read_file`, `_handle_think`) в `app/tools/handlers.py`.
 - [x] Пауза на пользовательскую проверку: `python -m pytest tests/test_mcp_router.py::test_tools_call`.
 - [x] Пауза на пользовательскую проверку: `jupyter-notebook` `/Users/romankassymov/python_web/jupyter-diagnostic/notebooks/mcp-openai-router/mor-python.ipynb`, telegramm bot Xaia..
-- [ ] Вынести функции интеграции с OpenAI/Responses API и вспомогательные нормализации в `app/services/openai_responses.py`, обеспечить доступ к think-tool клиенту через зависимости.
+- [x] Вынести функции интеграции с OpenAI/Responses API и вспомогательные нормализации в `app/services/openai_responses.py`, обеспечить доступ к think-tool клиенту через зависимости.
 - [ ] Пауза на пользовательскую проверку: полный `python -m pytest` и ручной smoke-тест hosted tools (если доступно).
 - [ ] Пауза на пользовательскую проверку: `jupyter-notebook` `/Users/romankassymov/python_web/jupyter-diagnostic/notebooks/mcp-openai-router/mor-python.ipynb`, telegramm bot Xaia..
 - [ ] Создать `app/api/routes.py`, где разместить обработчики `initialize`, `tools/list`, `tools/call`, `health`; в `app/main.py` оставить только инициализацию приложения и импорт маршрутов.
