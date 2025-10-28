@@ -56,3 +56,6 @@ Where:
 - `full_branch_name` — the full name of the branch (for example, if the branch is `feature/new_feature`, then the name is not just `new_feature`, but `feature/new_feature`).
 - `title` — a short summary in English, consisting of 3–5–7 words.
 - `description` — a more detailed list of the changes or additions made, written in Russian.
+- Commit documentation should be prepared with respect to the files in the index, not the already committed changes.
+- The documentation is prepared without the usually required `.md` plan file.
+- The resulting content should be inserted into the `./.git/COMMIT_EDITMSG` file.
