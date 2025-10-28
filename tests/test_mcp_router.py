@@ -271,3 +271,53 @@ def test_chat_handles_think_function_call(monkeypatch: pytest.MonkeyPatch) -> No
     assert follow_up_input["call_id"] == think_call_id
     assert follow_up_input["output"][0]["type"] == "input_text"
     assert follow_up_input["output"][0]["text"] == "Первый блок\n\nВторой блок"
+
+
+def test_chat_returns_error_with_think_logs(monkeypatch: pytest.MonkeyPatch) -> None:
+    think_call_id = "call_think_error"
+    payload = {
+        "id": "resp_error",
+        "status": "completed",
+        "output": [
+            {
+                "type": "message",
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "function_call",
+                        "id": "fc_err",
+                        "call_id": think_call_id,
+                        "name": "think",
+                        "arguments": '{"thought": "fail"}',
+                    }
+                ],
+            }
+        ],
+    }
+    dummy_client = DummyOpenAIClient(payload)
+    monkeypatch.setattr(mcp, "_create_openai_client", lambda: dummy_client)
+
+    def fake_handle_think(arguments: Dict[str, Any]) -> Dict[str, Any]:
+        return mcp._tool_error("think failed", metadata={"reason": "mock"})
+
+    monkeypatch.setattr(mcp, "_handle_think", fake_handle_think)
+    monkeypatch.setattr(mcp, "THINK_TOOL_CONFIG", mcp.ThinkToolConfig(enabled=True))
+
+    result = mcp._handle_chat(
+        {
+            "model": "gpt-think",
+            "messages": [
+                {"role": "system", "content": "Test harness."},
+                {"role": "user", "content": "Запусти think."},
+            ],
+        }
+    )
+
+    assert result["isError"] is True
+    error_text = result["content"][0]["text"]
+    assert "think failed" in error_text
+    metadata = result.get("metadata") or {}
+    think_logs = metadata.get("thinkTool") or []
+    assert think_logs[0]["callId"] == think_call_id
+    assert think_logs[0]["status"] == "error"
+    assert metadata.get("reason") == "mock"

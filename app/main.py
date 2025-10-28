@@ -41,7 +41,8 @@ from .services.openai_responses import (
     normalise_responses_output,
     normalize_input_messages,
 )
-from .services.think_processor import ThinkToolProcessor
+from .services.chat_processing import ProcessingResult
+from .services.think_processor import ThinkLogEntry, ThinkToolProcessor
 from .think_client import ThinkToolConfig
 
 
@@ -160,7 +161,7 @@ def _handle_chat(arguments: Dict[str, Any]) -> ToolResponse:
     #  - remaining_tool_calls: вызовы инструментов, которые модель запросила, но их должен выполнить MCP-клиент.
     follow_up_data = _resolve_response(response_data)
     final_meta: Optional[Dict[str, Any]] = None
-    think_logs: List[Dict[str, Any]] = []
+    think_logs: List[ThinkLogEntry] = []
     final_content: List[Dict[str, Any]] = []
     remaining_tool_calls: List[Dict[str, Any]] = []
 
@@ -199,11 +200,18 @@ def _handle_chat(arguments: Dict[str, Any]) -> ToolResponse:
             remaining_tool_calls = tool_calls
             break
 
-        follow_up_inputs, remaining_tool_calls, iteration_logs, error_info = think_processor.process(tool_calls)
-        think_logs.extend(iteration_logs)
+        think_result = think_processor.process(tool_calls)
+        think_logs.extend(think_result.think_logs)
+        remaining_tool_calls = think_result.remaining_calls
+        follow_up_inputs = think_result.follow_up_inputs
 
-        if error_info:
-            return _tool_error(error_info["message"], metadata=error_info.get("metadata"))
+        if think_result.is_error():
+            error_response = ProcessingResult(
+                think_logs=think_logs,
+                error_message=think_result.error_message,
+                error_metadata=think_result.error_metadata,
+            )
+            return error_response.to_tool_response()
 
         if follow_up_inputs:
             logger.info("Prepared function_call_output payloads: %s", follow_up_inputs)
@@ -249,22 +257,13 @@ def _handle_chat(arguments: Dict[str, Any]) -> ToolResponse:
         return _tool_error("Reached maximum tool iterations without completion.")
 
     # 12) Сборка итогового ToolResponse: контент + (неисполненные) tool_calls + метаданные.
-    # Этот объект — унифицированный контракт для MCP-слоя над любым движком генерации.
-    result = _tool_ok(content=final_content, tool_calls=remaining_tool_calls, metadata=final_meta or None)
-    # Добавляем журнал выполнения think в metadata, чтобы клиент мог показать цепочку
-    # вызовов/статусов пользователю или использовать в telemetry.
-    if think_logs:
-        metadata = result.setdefault("metadata", {})
-        metadata["thinkTool"] = [
-            {
-                "callId": log.get("callId"),
-                "status": log.get("status"),
-                "content": log.get("result", {}).get("content"),
-                "metadata": log.get("result", {}).get("metadata"),
-            }
-            for log in think_logs
-        ]
-    return result
+    processing_result = ProcessingResult(
+        content=final_content,
+        tool_calls=remaining_tool_calls,
+        metadata=final_meta or None,
+        think_logs=think_logs,
+    )
+    return processing_result.to_tool_response()
 
 
 TOOL_HANDLERS: Dict[str, ToolHandler] = {
