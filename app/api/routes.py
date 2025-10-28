@@ -78,8 +78,16 @@ def _require_session(params: Dict[str, Any]) -> SessionState:
             raise McpSessionError(f"Unknown sessionId '{session_id}'", code=-32003)
     return session
 
+# NOTE:
+# All _handle_* functions below are intentionally synchronous (def, not async),
+# because they perform only CPU-bound or simple in-memory operations and do not
+# contain any 'await' expressions. This avoids unnecessary coroutine wrapping
+# and satisfies SonarQube rule python:S7503 ("Use asynchronous features in this
+# function or remove the async keyword").
+# If future changes introduce actual async I/O, these can be safely converted
+# back to 'async def'.
 
-async def _handle_initialize(params: Dict[str, Any], request_id: Any) -> JsonRpcResponse | JsonRpcError:
+def _handle_initialize(params: Dict[str, Any], request_id: Any) -> JsonRpcResponse | JsonRpcError:
     try:
         parsed = InitializeParams.model_validate(params)
     except ValidationError as exc:
@@ -100,7 +108,7 @@ async def _handle_initialize(params: Dict[str, Any], request_id: Any) -> JsonRpc
     return JsonRpcResponse(result=result, id=request_id)
 
 
-async def _handle_ping(params: Dict[str, Any], request_id: Any) -> JsonRpcResponse | JsonRpcError:
+def _handle_ping(params: Dict[str, Any], request_id: Any) -> JsonRpcResponse | JsonRpcError:
     try:
         session = _require_session(params)
     except McpSessionError as exc:
@@ -108,14 +116,14 @@ async def _handle_ping(params: Dict[str, Any], request_id: Any) -> JsonRpcRespon
     return JsonRpcResponse(result={"sessionId": session.id}, id=request_id)
 
 
-async def _handle_shutdown(params: Dict[str, Any], request_id: Any) -> JsonRpcResponse:
+def _handle_shutdown(params: Dict[str, Any], request_id: Any) -> JsonRpcResponse:
     session_id = params.get("sessionId")
     if isinstance(session_id, str):
         ACTIVE_SESSIONS.pop(session_id, None)
     return JsonRpcResponse(result={}, id=request_id)
 
 
-async def _handle_tools_list(params: Dict[str, Any], request_id: Any) -> JsonRpcResponse | JsonRpcError:
+def _handle_tools_list(params: Dict[str, Any], request_id: Any) -> JsonRpcResponse | JsonRpcError:
     try:
         _require_session(params)
     except McpSessionError as exc:
@@ -127,7 +135,7 @@ async def _handle_tools_list(params: Dict[str, Any], request_id: Any) -> JsonRpc
     return JsonRpcResponse(result=result, id=request_id)
 
 
-async def _handle_tools_call(params: Dict[str, Any], request_id: Any) -> JsonRpcResponse | JsonRpcError:
+def _handle_tools_call(params: Dict[str, Any], request_id: Any) -> JsonRpcResponse | JsonRpcError:
     try:
         _require_session(params)
     except McpSessionError as exc:
@@ -153,7 +161,7 @@ async def _handle_tools_call(params: Dict[str, Any], request_id: Any) -> JsonRpc
     return JsonRpcResponse(result=result, id=request_id)
 
 
-async def _handle_legacy(params: Dict[str, Any], method: str, request_id: Any) -> JsonRpcResponse:
+def _handle_legacy(params: Dict[str, Any], method: str, request_id: Any) -> JsonRpcResponse:
     legacy_arguments = params if isinstance(params, dict) else {}
     if method == "tools.echo":
         return JsonRpcResponse(result=_handle_echo(legacy_arguments), id=request_id)
@@ -164,12 +172,12 @@ async def _handle_legacy(params: Dict[str, Any], method: str, request_id: Any) -
 
 
 @router.get("/health")
-async def health() -> Dict[str, str]:
+def health() -> Dict[str, str]:
     return {"status": "ok"}
 
 
 @router.get("/mcp")
-async def mcp_info() -> Dict[str, Any]:
+def mcp_info() -> Dict[str, Any]:
     return {
         "protocolVersion": PROTOCOL_VERSION,
         "capabilities": SERVER_CAPABILITIES,
@@ -178,26 +186,26 @@ async def mcp_info() -> Dict[str, Any]:
 
 
 @router.post("/mcp")
-async def mcp_rpc(req: JsonRpcRequest):
+def mcp_rpc(req: JsonRpcRequest):
     method = req.method
     params = req.params or {}
 
     try:
         # Fast path dispatch table
         if method == "initialize":
-            return await _handle_initialize(params, req.id)
+            return _handle_initialize(params, req.id)
         if method == "ping":
-            return await _handle_ping(params, req.id)
+            return _handle_ping(params, req.id)
         if method == "shutdown":
-            return await _handle_shutdown(params, req.id)
+            return _handle_shutdown(params, req.id)
         if method == "tools/list":
-            return await _handle_tools_list(params, req.id)
+            return _handle_tools_list(params, req.id)
         if method == "tools/call":
-            return await _handle_tools_call(params, req.id)
+            return _handle_tools_call(params, req.id)
 
         # Optional legacy methods support
         if ENABLE_LEGACY_METHODS and method in {"tools.echo", "tools.read_file"}:
-            return await _handle_legacy(params, method, req.id)
+            return _handle_legacy(params, method, req.id)
 
         return _json_rpc_error(
             -32601,
