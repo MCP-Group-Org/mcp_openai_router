@@ -26,11 +26,11 @@
 - [x] Пауза на пользовательскую проверку: `python -m pytest tests/test_mcp_router.py::test_tools_call`.
 - [x] Пауза на пользовательскую проверку: `jupyter-notebook` `/Users/romankassymov/python_web/jupyter-diagnostic/notebooks/mcp-openai-router/mor-python.ipynb`, telegramm bot Xaia..
 - [x] Вынести функции интеграции с OpenAI/Responses API и вспомогательные нормализации в `app/services/openai_responses.py`, обеспечить доступ к think-tool клиенту через зависимости.
-- [ ] Пауза на пользовательскую проверку: полный `python -m pytest` и ручной smoke-тест hosted tools (если доступно).
-- [ ] Пауза на пользовательскую проверку: `jupyter-notebook` `/Users/romankassymov/python_web/jupyter-diagnostic/notebooks/mcp-openai-router/mor-python.ipynb`, telegramm bot Xaia..
-- [ ] Создать `app/api/routes.py`, где разместить обработчики `initialize`, `tools/list`, `tools/call`, `health`; в `app/main.py` оставить только инициализацию приложения и импорт маршрутов.
-- [ ] Пауза на пользовательскую проверку: локальный прогон `uvicorn` + `pytest`, убедиться в отсутствии regresison в логах.
-- [ ] Пауза на пользовательскую проверку: `jupyter-notebook` `/Users/romankassymov/python_web/jupyter-diagnostic/notebooks/mcp-openai-router/mor-python.ipynb`, telegramm bot Xaia..
+- [x]  Пауза на пользовательскую проверку: полный `python -m pytest` и ручной smoke-тест hosted tools (если доступно).
+- [x]  Пауза на пользовательскую проверку: `jupyter-notebook` `/Users/romankassymov/python_web/jupyter-diagnostic/notebooks/mcp-openai-router/mor-python.ipynb`, telegramm bot Xaia..
+- [x] Создать `app/api/routes.py`, где разместить обработчики `initialize`, `tools/list`, `tools/call`, `health`; в `app/main.py` оставить только инициализацию приложения и импорт маршрутов.
+- [x] Пауза на пользовательскую проверку: локальный прогон `uvicorn` + `pytest`, убедиться в отсутствии regresison в логах.
+- [x] Пауза на пользовательскую проверку: `jupyter-notebook` `/Users/romankassымов/python_web/jupyter-diagnostic/notebooks/mcp-openai-router/mor-python.ipynb`, telegramm bot Xaia..
 - [ ] Актуализировать документацию (README/докстринги) под новую структуру.
 - [ ] Пауза на пользовательскую проверку: визуальный аудит структуры, `python -m compileall app`.
 - [ ] Пауза на пользовательскую проверку: `jupyter-notebook` `/Users/romankassymov/python_web/jupyter-diagnostic/notebooks/mcp-openai-router/mor-python.ipynb`, telegramm bot Xaia..
