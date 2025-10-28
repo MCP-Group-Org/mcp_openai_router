@@ -41,6 +41,7 @@ from .services.openai_responses import (
     normalise_responses_output,
     normalize_input_messages,
 )
+from .services.think_processor import ThinkToolProcessor
 from .think_client import ThinkToolConfig
 
 
@@ -128,6 +129,7 @@ def _handle_chat(arguments: Dict[str, Any]) -> ToolResponse:
         max_polls=max_polls,
         semaphore=POLL_SEM,
     )
+    think_processor = ThinkToolProcessor(_handle_think)
 
     # 6) Вспомогательная функция опроса статуса ответа.
     # Используется, когда первоначальный статус — queued/in_progress, или когда
@@ -167,22 +169,7 @@ def _handle_chat(arguments: Dict[str, Any]) -> ToolResponse:
     max_turns = 15
     turn = 0
 
-    # 9) Хелпер: приводим контент от think-инструмента к простому тексту.
-    # Ответ think может быть массивом блоков; мы извлекаем текст и склеиваем
-    # его, чтобы передать обратно в Responses API как function_call_output.
-    def _convert_think_content(blocks: Optional[List[Dict[str, Any]]]) -> str:
-        converted: List[str] = []
-        for block in blocks or []:
-            if not isinstance(block, dict):
-                continue
-            text = block.get("text")
-            if isinstance(text, str) and text.strip():
-                converted.append(text.strip())
-        if not converted:
-            return "ok"
-        return "\n\n".join(converted)
-
-    # 10) Основной цикл обработки ответа и инструментов.
+    # 9) Основной цикл обработки ответа и инструментов.
     # На каждом шаге нормализуем ответ (responses/chat-completions),
     # проверяем, запросила ли модель инструменты, и либо завершаем,
     # либо исполняем think и отправляем follow-up.
@@ -212,63 +199,11 @@ def _handle_chat(arguments: Dict[str, Any]) -> ToolResponse:
             remaining_tool_calls = tool_calls
             break
 
-        # Подготовка данных для возможного follow-up запроса: сюда соберём
-        # результаты работы think-инструмента, чтобы отправить их обратно в модель.
-        follow_up_inputs: List[Dict[str, Any]] = []
-        remaining_tool_calls = []
+        follow_up_inputs, remaining_tool_calls, iteration_logs, error_info = think_processor.process(tool_calls)
+        think_logs.extend(iteration_logs)
 
-        # Перебираем запрошенные инструментальные вызовы. Мы поддерживаем локально
-        # только think: остальные оставляем "как есть", чтобы их обработал внешний MCP-клиент.
-        for call in tool_calls:
-            if call.get("toolName") != "think":
-                remaining_tool_calls.append(call)
-                continue
-
-            logger.info("Processing think tool call: %s", call)
-            arguments = call.get("arguments") or {}
-            if not isinstance(arguments, dict):
-                arguments = {"raw": arguments}
-
-            # Вызываем think-инструмент локально. Он может вернуть content (логи/размышления)
-            # или ошибку. Ведём журнал для диагностики и для включения в metadata ответа.
-            think_result = _handle_think(arguments)
-            think_logs.append(
-                {
-                    "callId": call.get("id"),
-                    "status": "error" if think_result.get("isError") else "ok",
-                    "result": think_result,
-                }
-            )
-
-            # Если think завершился ошибкой, формируем человекочитаемое сообщение и
-            # сразу возвращаем ToolResponse с ошибкой — дальнейшие follow-up не имеет смысла.
-            if think_result.get("isError"):
-                error_blocks = think_result.get("content") or [{"type": "text", "text": "think-tool returned error"}]
-                error_texts = []
-                for block in error_blocks:
-                    if isinstance(block, dict) and isinstance(block.get("text"), str):
-                        error_texts.append(block["text"])
-                message = "\n".join(error_texts) or "think-tool returned error"
-                return _tool_error(message, metadata=think_result.get("metadata"))
-
-            tool_call_id = call.get("id")
-            if not isinstance(tool_call_id, str) or not tool_call_id:
-                return _tool_error("Invalid think-tool call identifier.")
-
-            # Преобразуем результат think в формат function_call_output, который понимает
-            # Responses API: связываем с исходным call_id и передаём текст в виде input_text.
-            follow_up_inputs.append(
-                {
-                    "type": "function_call_output",
-                    "call_id": tool_call_id,
-                    "output": [
-                        {
-                            "type": "input_text",
-                            "text": _convert_think_content(think_result.get("content")),
-                        }
-                    ],
-                }
-            )
+        if error_info:
+            return _tool_error(error_info["message"], metadata=error_info.get("metadata"))
 
         if follow_up_inputs:
             logger.info("Prepared function_call_output payloads: %s", follow_up_inputs)
