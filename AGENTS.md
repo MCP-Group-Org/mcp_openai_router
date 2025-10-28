@@ -8,10 +8,11 @@ and for each new task create a `[task_name].md` file containing the description,
 
 - Always communicate and comment in **Russian** when working in this repository.  
 - Start with a **minimum viable product (MVP)** and postpone advanced improvements until the base logic is verified.  
-- For every new task, create a `[task_name].md` file that includes:  
+- Create a `[task_name].md` file only when you take on a concrete task that requires execution (implementation, analysis, research). The file must include:  
   - the problem statement,  
   - the proposed approach,  
   - a checklist ([]/[x]) with control points (tests, analysis, commits).  
+- Do not create a task file for requests that are not task executions (questions, explanations, descriptions, commit documentation) unless the user explicitly requires it.  
 - Project structure and module organization are described in `README.md`.
 
 ## Coding Style & Naming Conventions
