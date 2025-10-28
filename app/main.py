@@ -32,6 +32,7 @@ from .tools.registry import ToolHandler, ToolResponse, ToolSchema, ToolSpec, TOO
 from .services.openai_responses import (
     ChatArgError,
     OpenAIClientAdapter,
+    ResponsePoller,
     build_request_payload,
     create_openai_client,
     extract_chat_params,
@@ -121,54 +122,18 @@ def _handle_chat(arguments: Dict[str, Any]) -> ToolResponse:
     #  - MAX_POLLS: ограничение числа попыток, чтобы не зависнуть в ожидании.
     poll_delay = POLL_DELAY
     max_polls = MAX_POLLS
+    poller = ResponsePoller(
+        client_adapter,
+        poll_delay=poll_delay,
+        max_polls=max_polls,
+        semaphore=POLL_SEM,
+    )
 
     # 6) Вспомогательная функция опроса статуса ответа.
     # Используется, когда первоначальный статус — queued/in_progress, или когда
     # SDK вернул ответ без финального статуса. Реализуем аккуратный поллинг.
     def _poll_response(response_id: str, initial: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-        if not supports_retrieve:
-            return initial or {}
-        # Ограничиваем параллельный поллинг через семафор POLL_SEM, чтобы не исчерпать
-        # соединения/ресурсы клиента при массовых одновременных запросах.
-        acquired = POLL_SEM.acquire(timeout=5.0)
-        if not acquired:
-            logger.warning("responses.retrieve semaphore timeout — skipping poll for %s", response_id)
-            return initial or {}
-        try:
-            data = initial or {}
-            status = data.get("status")
-            # Основной цикл опроса: не более max_polls итераций. На каждом шаге пытаемся
-            # получить свежие данные через responses.retrieve и проверяем статус.
-            if status and status not in {"queued", "in_progress"}:
-                return data
-            polls = 0
-            t_start = time.time()
-            while polls < max_polls:
-                t0 = time.time()
-                try:
-                    retrieved = client_adapter.retrieve_response(response_id)
-                except Exception as exc:  # pragma: no cover - сеть/SDK
-                    logger.warning("responses.retrieve failed: %s", exc)
-                    break
-                dt = (time.time() - t0) * 1000.0
-                if not retrieved:
-                    logger.info("responses.retrieve empty in %.1f ms (poll=%d)", dt, polls)
-                    break
-                data = _maybe_model_dump(retrieved)
-                status = data.get("status")
-                # Если пришёл терминальный статус (например, "completed" или "failed"),
-                # возвращаем данные немедленно, фиксируя в логах общее время ожидания.
-                if status and status not in {"queued", "in_progress"}:
-                    total_ms = (time.time() - t_start) * 1000.0
-                    logger.info("responses.retrieve terminal status=%s in %.1f ms after %d polls", status, total_ms, polls + 1)
-                    return data
-                polls += 1
-                time.sleep(poll_delay)
-            total_ms = (time.time() - t_start) * 1000.0
-            logger.info("responses.retrieve hit poll limit after %d polls in %.1f ms (last status=%s)", polls, total_ms, status)
-            return data
-        finally:
-            POLL_SEM.release()
+        return poller.poll(response_id, initial)
 
     # 7) Унификация получения финального ответа.
     # Если статус уже финальный — просто возвращаем. Если статус не указан, но

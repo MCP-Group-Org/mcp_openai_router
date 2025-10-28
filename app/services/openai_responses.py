@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import time
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 logger = logging.getLogger("mcp_openai_router.services.openai_responses")
@@ -77,6 +78,87 @@ class OpenAIClientAdapter:
         """Проверяет, доступен ли метод retrieve у Responses API."""
         self.ensure_ready()
         return self._retrieve_fn is not None
+
+
+class ResponsePoller:
+    """Оборачивает логику опроса Responses API с управлением ресурсами."""
+
+    def __init__(
+        self,
+        client_adapter: OpenAIClientAdapter,
+        *,
+        poll_delay: float,
+        max_polls: int,
+        semaphore: Optional[Any] = None,
+        acquire_timeout: float = 5.0,
+    ) -> None:
+        self.client_adapter = client_adapter
+        self.poll_delay = poll_delay
+        self.max_polls = max_polls
+        self.semaphore = semaphore
+        self.acquire_timeout = acquire_timeout
+
+    def poll(self, response_id: str, initial: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """Ожидает терминальный статус ответа или возвращает последнее известное состояние."""
+        if not self.client_adapter.can_retrieve():
+            return initial or {}
+
+        if self.semaphore is None:
+            return self._do_poll(response_id, initial)
+
+        acquired = self.semaphore.acquire(timeout=self.acquire_timeout)
+        if not acquired:
+            logger.warning("responses.retrieve semaphore timeout — skipping poll for %s", response_id)
+            return initial or {}
+        try:
+            return self._do_poll(response_id, initial)
+        finally:
+            self.semaphore.release()
+
+    def _do_poll(self, response_id: str, initial: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        data = initial or {}
+        status = data.get("status")
+        if status and status not in {"queued", "in_progress"}:
+            return data
+
+        polls = 0
+        t_start = time.time()
+
+        while polls < self.max_polls:
+            t0 = time.time()
+            try:
+                retrieved = self.client_adapter.retrieve_response(response_id)
+            except Exception as exc:  # pragma: no cover - сеть/SDK
+                logger.warning("responses.retrieve failed: %s", exc)
+                break
+            dt = (time.time() - t0) * 1000.0
+            if not retrieved:
+                logger.info("responses.retrieve empty in %.1f ms (poll=%d)", dt, polls)
+                break
+
+            data = maybe_model_dump(retrieved)
+            status = data.get("status")
+            if status and status not in {"queued", "in_progress"}:
+                total_ms = (time.time() - t_start) * 1000.0
+                logger.info(
+                    "responses.retrieve terminal status=%s in %.1f ms after %d polls",
+                    status,
+                    total_ms,
+                    polls + 1,
+                )
+                return data
+
+            polls += 1
+            time.sleep(self.poll_delay)
+
+        total_ms = (time.time() - t_start) * 1000.0
+        logger.info(
+            "responses.retrieve hit poll limit after %d polls in %.1f ms (last status=%s)",
+            polls,
+            total_ms,
+            status,
+        )
+        return data
 
 
 def maybe_model_dump(value: Any) -> Dict[str, Any]:
