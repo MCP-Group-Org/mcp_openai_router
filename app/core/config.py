@@ -39,6 +39,12 @@ POLL_SEM = Semaphore(max(1, RESPONSES_POLL_MAX_CONCURRENCY))
 THINK_TOOL_CONFIG = ThinkToolConfig.from_env()
 THINK_TOOL_CLIENT: Optional[ThinkToolClient] = create_think_tool_client(THINK_TOOL_CONFIG)
 
+# Интервал между попытками опроса Responses API (в секундах)
+POLL_DELAY = float(os.getenv("POLL_DELAY", "0.5"))
+
+# Максимальное число попыток опроса перед завершением ожидания
+MAX_POLLS = int(os.getenv("MAX_POLLS", "20"))
+
 __all__ = [
     "BASE_DIR",
     "ENABLE_LEGACY_METHODS",
@@ -50,4 +56,6 @@ __all__ = [
     "SERVER_INFO",
     "THINK_TOOL_CLIENT",
     "THINK_TOOL_CONFIG",
+    "POLL_DELAY",
+    "MAX_POLLS"
 ]
