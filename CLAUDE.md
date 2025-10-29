@@ -119,8 +119,10 @@ The `chat` tool is the main feature and follows this flow:
 - **`deploy/`**: Ingress templates and environment files for production deployment.
 - **`app/`**: All application code.
 - **`tests/`**: pytest scenarios.
+- **`requirements.txt`**: Python dependencies with version constraints.
 - **`docker-compose*.yaml`**: Local and production Docker stack configurations.
 - **`.env`**: Environment variables (not committed; see `.env.example` if present).
+- **`.dockerignore`**: Files excluded from Docker build context.
 
 ## Development Workflow
 
@@ -256,8 +258,10 @@ http://mcp-openai-router:8080/mcp
 - **`deploy/`**: Шаблоны ingress и файлы окружения для продакшен-развёртывания.
 - **`app/`**: Весь код приложения.
 - **`tests/`**: pytest-сценарии.
+- **`requirements.txt`**: Python-зависимости с ограничениями версий.
 - **`docker-compose*.yaml`**: Конфигурации локального и продакшен Docker-стека.
 - **`.env`**: Переменные окружения (не коммитится; см. `.env.example`, если присутствует).
+- **`.dockerignore`**: Файлы, исключённые из контекста сборки Docker.
 
 ## Рабочий процесс разработки
 

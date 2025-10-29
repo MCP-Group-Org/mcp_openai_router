@@ -19,9 +19,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /app
 
 # Зависимости
+COPY requirements.txt /app/
 RUN --mount=type=cache,target=/root/.cache/pip \
     pip install --upgrade pip && \
-    pip install fastapi fastapi-mcp "mcp[cli]" openai "uvicorn[standard]" pydantic-settings langsmith httpx
+    pip install -r requirements.txt
 
 # Код
 COPY . /app

@@ -1,0 +1,13 @@
+# Core dependencies
+fastapi>=0.115.0
+fastapi-mcp>=0.2.0
+mcp[cli]>=1.0.0
+openai>=1.54.0
+uvicorn[standard]>=0.32.0
+pydantic-settings>=2.6.0
+
+# Observability
+langsmith>=0.1.0
+
+# HTTP client (for think-tool)
+httpx>=0.27.0
