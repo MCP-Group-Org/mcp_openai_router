@@ -8,29 +8,56 @@ from __future__ import annotations
 
 import json
 import logging
-import os
-import sys
 import time
-from threading import Semaphore
-from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple, Literal
+from typing import Any, Dict, List, Optional
 from uuid import uuid4
 
 from fastapi import FastAPI
-from pydantic import BaseModel, Field, ValidationError
 
-from .think_client import ThinkToolClient, ThinkToolConfig, create_think_tool_client  # think-tool: конфиг+клиент
-
-try:
-    # Optional runtime dependency; in tests we patch the factory instead.
-    from openai import OpenAI
-except Exception:  # pragma: no cover
-    OpenAI = None  # type: ignore[assignment]
+from .api import configure_routes, router as api_router
+from .core.config import (
+    ENABLE_LEGACY_METHODS,
+    MAX_POLLS,
+    POLL_DELAY,
+    POLL_SEM,
+    PROTOCOL_VERSION,
+    REQUIRE_SESSION,
+    SERVER_CAPABILITIES,
+    SERVER_INFO,
+    THINK_TOOL_CONFIG,
+)
+from .core.session import ACTIVE_SESSIONS
+from .tools.handlers import _handle_echo, _handle_read_file, _handle_think, _tool_error, _tool_ok
+from .tools.registry import ToolHandler, ToolResponse, ToolSchema, ToolSpec, TOOLS
+from .services.openai_responses import (
+    ChatArgError,
+    OpenAIClientAdapter,
+    ResponsePoller,
+    build_request_payload,
+    create_openai_client,
+    extract_chat_params,
+    maybe_model_dump,
+    normalise_chat_completion,
+    normalise_responses_output,
+    normalize_input_messages,
+)
+from .services.chat_processing import ProcessingResult
+from .services.think_processor import ThinkLogEntry, ThinkToolProcessor
+from .think_client import ThinkToolConfig
 
 
 logger = logging.getLogger("mcp_openai_router")
 if not logger.handlers:
     logging.basicConfig(level=logging.INFO)
+
+
+# Тонкие обёртки сохранены ради тестов, которые monkeypatch по именам внутри app.main.
+def _create_openai_client() -> Any:
+    return create_openai_client()
+
+
+def _maybe_model_dump(value: Any) -> Dict[str, Any]:
+    return maybe_model_dump(value)
 
 # =========================
 # FastAPI app
@@ -38,640 +65,53 @@ if not logger.handlers:
 app = FastAPI(title="MCP - OpenAI Router", version="0.0.2")
 
 
-# -------- JSON-RPC 2.0 models --------
-class JsonRpcRequest(BaseModel):
-    jsonrpc: Literal["2.0"] = "2.0"
-    method: str
-    params: Optional[Dict[str, Any]] = None
-    id: Optional[Any] = None
-
-
-class JsonRpcResponse(BaseModel):
-    jsonrpc: Literal["2.0"] = "2.0"
-    result: Any = None
-    id: Optional[Any] = None
-
-
-class JsonRpcErrorObj(BaseModel):
-    code: int
-    message: str
-    data: Optional[Any] = None
-
-
-class JsonRpcError(BaseModel):
-    jsonrpc: Literal["2.0"] = "2.0"
-    error: JsonRpcErrorObj
-    id: Optional[Any] = None
-
-
-# -------- MCP models --------
-class InitializeParams(BaseModel):
-    protocolVersion: Optional[str] = None
-    clientInfo: Dict[str, Any] = Field(default_factory=dict)
-    capabilities: Dict[str, Any] = Field(default_factory=dict)
-
-
-class SessionState(BaseModel):
-    id: str
-    client_info: Dict[str, Any] = Field(default_factory=dict)
-    capabilities: Dict[str, Any] = Field(default_factory=dict)
-
-
-# =========================
-# Constants and feature flags
-# =========================
-PROTOCOL_VERSION = "1.0"
-SERVER_INFO = {
-    "name": "mcp-openai-router",
-    "version": os.getenv("APP_VERSION", "0.0.2"),
-}
-SERVER_CAPABILITIES = {
-    "tools": {
-        "listChangedNotification": False,
-        "parallelCalls": True,
-    },
-    "sampling": {
-        "supportsHostedTools": True,
-    },
-}
-ENABLE_LEGACY_METHODS = (
-    "--legacy" in sys.argv
-    or os.getenv("MCP_ENABLE_LEGACY", "").lower() in {"1", "true", "yes"}
-)
-BASE_DIR = Path("/app").resolve()
-ACTIVE_SESSIONS: Dict[str, SessionState] = {}
-REQUIRE_SESSION = os.getenv("MCP_REQUIRE_SESSION", "1").strip().lower() in {"1", "true", "yes", "on"}
-
-# Limit concurrent polling requests to avoid exhausting the HTTP connection pool
-RESPONSES_POLL_MAX_CONCURRENCY = int(os.getenv("RESPONSES_POLL_MAX_CONCURRENCY", "8"))
-POLL_SEM = Semaphore(max(1, RESPONSES_POLL_MAX_CONCURRENCY))
-
-# think-tool: фиксируем настройки/клиент на уровне модуля, чтобы переиспользовать внутри обработчиков
-THINK_TOOL_CONFIG = ThinkToolConfig.from_env()
-THINK_TOOL_CLIENT: Optional[ThinkToolClient] = create_think_tool_client(THINK_TOOL_CONFIG)
-
-
 # =========================
 # MCP tool registry
 # =========================
-class ToolSchema(BaseModel):
-    type: Literal["object"] = "object"
-    properties: Dict[str, Any] = Field(default_factory=dict)
-    required: List[str] = Field(default_factory=list)
-    additionalProperties: bool = False
-
-    def as_dict(self) -> Dict[str, Any]:
-        return self.model_dump()
 
 
-class ToolSpec(BaseModel):
-    name: str
-    description: str
-    input_schema: ToolSchema
-    output_schema: Optional[ToolSchema] = None
-
-    def as_mcp_dict(self) -> Dict[str, Any]:
-        payload = {
-            "name": self.name,
-            "description": self.description,
-            "inputSchema": self.input_schema.as_dict(),
-        }
-        if self.output_schema is not None:
-            payload["outputSchema"] = self.output_schema.as_dict()
-        return payload
-
-
-ToolResponse = Dict[str, Any]
-ToolHandler = Callable[[Dict[str, Any]], ToolResponse]
-
-
-TOOLS: Dict[str, ToolSpec] = {
-    "echo": ToolSpec(
-        name="echo",
-        description="Echo text back.",
-        input_schema=ToolSchema(
-            properties={
-                "text": {"type": "string", "description": "Text to echo"},
-            },
-            required=["text"],
-        ),
-        output_schema=ToolSchema(
-            properties={
-                "content": {"type": "array", "description": "Single text block"},
-                "isError": {"type": "boolean"},
-            },
-        ),
-    ),
-    "read_file": ToolSpec(
-        name="read_file",
-        description="Read a UTF-8 text file from the server's /app directory (relative path).",
-        input_schema=ToolSchema(
-            properties={
-                "path": {"type": "string", "description": "Relative path under /app"},
-                "max_bytes": {
-                    "type": "integer",
-                    "description": "Max bytes to read",
-                    "minimum": 1,
-                    "default": 200_000,
-                },
-            },
-            required=["path"],
-        ),
-        output_schema=ToolSchema(
-            properties={
-                "content": {"type": "array"},
-                "isError": {"type": "boolean"},
-            },
-        ),
-    ),
-    "chat": ToolSpec(
-        name="chat",
-        description="Call an OpenAI Responses API compatible endpoint.",
-        input_schema=ToolSchema(
-            properties={
-                "model": {"type": "string", "description": "Model name, e.g. gpt-4.1-mini"},
-                "messages": {
-                    "type": "array",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "role": {"type": "string", "description": "system|user|assistant|tool"},
-                            "content": {
-                                "anyOf": [
-                                    {"type": "string"},
-                                    {"type": "array", "items": {"type": "object"}},
-                                ]
-                            },
-                        },
-                        "required": ["role", "content"],
-                        "additionalProperties": False,
-                    },
-                    "description": "Conversation history in OpenAI chat format.",
-                },
-                "temperature": {"type": "number", "description": "0-2 range", "default": 0.7},
-                "max_tokens": {"type": "integer", "description": "Max output tokens for the response"},
-                "top_p": {"type": "number", "description": "Nucleus sampling"},
-                # ❗ Новое: для hosted tools (например, web_search в Responses API)
-                "tools": {
-                    "type": "array",
-                    "description": "Hosted tools for Responses API (e.g., [{'type':'web_search'}]).",
-                    "items": {"type": "object"},
-                },
-                "tool_choice": {
-                    "type": "string",
-                    "description": "Tool choice mode for Responses API (e.g., 'auto').",
-                },
-                "metadata": {"type": "object", "description": "Optional vendor-specific options"},
-                "parallelToolCalls": {
-                    "type": "boolean",
-                    "description": "Allow hosted tools to run in parallel",
-                },
-            },
-            required=["model", "messages"],
-        ),
-        output_schema=ToolSchema(
-            properties={
-                "content": {"type": "array"},
-                "toolCalls": {"type": "array"},
-                "isError": {"type": "boolean"},
-            },
-        ),
-    ),
-}
-
-
-# =========================
-# Helper utilities
-# =========================
-def _json_rpc_error(code: int, message: str, *, data: Any = None, request_id: Any = None) -> JsonRpcError:
-    return JsonRpcError(
-        error=JsonRpcErrorObj(code=code, message=message, data=data),
-        id=request_id,
-    )
-
-
-class McpSessionError(Exception):
-    def __init__(self, message: str, *, code: int = -32002, data: Any = None) -> None:
-        super().__init__(message)
-        self.code = code
-        self.data = data
-
-
-def _require_session(params: Dict[str, Any]) -> SessionState:
-    session_id = params.get("sessionId")
-    if not isinstance(session_id, str) or not session_id:
-        if not REQUIRE_SESSION:
-            session_id = "_auto"
-            session = ACTIVE_SESSIONS.get(session_id)
-            if session is None:
-                session = SessionState(id=session_id)
-                ACTIVE_SESSIONS[session_id] = session
-            params["sessionId"] = session_id
-            return session
-        raise McpSessionError("Missing sessionId", code=-32602)
-    session = ACTIVE_SESSIONS.get(session_id)
-    if session is None:
-        if not REQUIRE_SESSION:
-            session = SessionState(id=session_id)
-            ACTIVE_SESSIONS[session_id] = session
-        else:
-            raise McpSessionError(f"Unknown sessionId '{session_id}'", code=-32003)
-    return session
-
-
-def _tool_ok(
-    *,
-    content: Optional[List[Dict[str, Any]]] = None,
-    tool_calls: Optional[List[Dict[str, Any]]] = None,
-    metadata: Optional[Dict[str, Any]] = None,
-) -> ToolResponse:
-    payload: ToolResponse = {
-        "content": content or [],
-        "toolCalls": tool_calls or [],
-        "isError": False,
-    }
-    if metadata:
-        payload["metadata"] = metadata
-    return payload
-
-
-def _tool_error(message: str, *, metadata: Optional[Dict[str, Any]] = None) -> ToolResponse:
-    payload = {
-        "content": [{"type": "text", "text": message}],
-        "toolCalls": [],
-        "isError": True,
-    }
-    if metadata:
-        payload["metadata"] = metadata
-    return payload
-
-
-def _safe_read_file(path: str, *, max_bytes: int = 200_000) -> Dict[str, Any]:
-    raw = Path(path)
-    if raw.is_absolute() or ".." in raw.parts:
-        return {
-            "error": "Invalid path (absolute paths and traversal are not allowed)",
-            "path": str(raw),
-            "text": "",
-            "size": 0,
-        }
-    target = (BASE_DIR / raw).resolve()
-    if not str(target).startswith(str(BASE_DIR)):
-        return {
-            "error": "Path escapes base directory",
-            "path": str(raw),
-            "text": "",
-            "size": 0,
-        }
-    try:
-        data = target.read_bytes()[: max(1, int(max_bytes))]
-    except FileNotFoundError:
-        return {"error": "File not found", "path": str(raw), "text": "", "size": 0}
-    except Exception as exc:  # pragma: no cover - guardrail
-        return {
-            "error": f"{type(exc).__name__}: {exc}",
-            "path": str(raw),
-            "text": "",
-            "size": 0,
-        }
-    return {
-        "path": str(raw),
-        "size": len(data),
-        "text": data.decode("utf-8", errors="replace"),
-    }
-
-
-def _create_openai_client() -> Any:
-    if OpenAI is None:
-        raise RuntimeError("OpenAI SDK not available. Install the 'openai' package.")
-    api_key = os.getenv("OPENAI_API_KEY")
-    if not api_key:
-        raise RuntimeError("Missing OPENAI_API_KEY env var")
-    base_url = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
-    return OpenAI(api_key=api_key, base_url=base_url)
-
-
-def _maybe_model_dump(value: Any) -> Dict[str, Any]:
-    if value is None:
-        return {}
-    if hasattr(value, "model_dump") and callable(value.model_dump):
-        return value.model_dump()
-    if hasattr(value, "dict") and callable(value.dict):
-        return value.dict()  # type: ignore[return-value]
-    if isinstance(value, dict):
-        return value
-    try:
-        return json.loads(value)  # type: ignore[arg-type]
-    except Exception:
-        return {}
-
-
-def _convert_tool_call_block(block: Dict[str, Any]) -> Dict[str, Any]:
-    arguments = block.get("arguments")
-    if isinstance(arguments, str):
-        try:
-            arguments = json.loads(arguments)
-        except json.JSONDecodeError:
-            arguments = {"raw": arguments}
-    elif arguments is None:
-        arguments = {}
-    return {
-        "id": block.get("call_id") or block.get("id") or block.get("tool_call_id"),
-        "toolName": block.get("name") or block.get("tool_name"),
-        "arguments": arguments,
-    }
-
-
-def _normalise_responses_output(data: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], Dict[str, Any]]:
-    content_blocks: List[Dict[str, Any]] = []
-    tool_calls: List[Dict[str, Any]] = []
-
-    outputs = data.get("output") or data.get("outputs") or []
-    for output in outputs:
-        if isinstance(output, str):
-            try:
-                output = json.loads(output)
-            except json.JSONDecodeError:
-                logger.debug("Skipping non-JSON output entry: %s", output)
-                continue
-        if not isinstance(output, dict):
-            continue
-
-        output_type = output.get("type")
-        if output_type == "message":
-            for block in output.get("content", []):
-                block_type = block.get("type")
-                if block_type in {"output_text", "text", "input_text"}:
-                    text = block.get("text") or block.get("value") or ""
-                    if text:
-                        content_blocks.append({"type": "text", "text": text})
-                elif block_type in {"tool_call", "function_call"}:
-                    tool_calls.append(_convert_tool_call_block(block))
-        elif output_type in {"tool_call", "function_call"}:
-            tool_calls.append(_convert_tool_call_block(output))
-        elif output_type in {"output_text", "text"}:
-            text = output.get("text") or ""
-            if text:
-                content_blocks.append({"type": "text", "text": text})
-
-    usage = data.get("usage") or {}
-    finish_reason = data.get("status") or data.get("finish_reason")
-    metadata: Dict[str, Any] = {}
-    if usage:
-        metadata["usage"] = usage
-    if finish_reason:
-        metadata["finishReason"] = finish_reason
-    if data.get("id"):
-        metadata["responseId"] = data["id"]
-    return content_blocks, tool_calls, metadata
-
-
-def _normalise_chat_completion(data: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], Dict[str, Any]]:
-    content_blocks: List[Dict[str, Any]] = []
-    tool_calls: List[Dict[str, Any]] = []
-    metadata: Dict[str, Any] = {}
-
-    choices = data.get("choices") or []
-    if not choices:
-        return content_blocks, tool_calls, metadata
-
-    first = choices[0]
-    message = first.get("message") or {}
-    content = message.get("content")
-    if isinstance(content, list):
-        for item in content:
-            if isinstance(item, dict) and item.get("type") == "text":
-                text = item.get("text")
-                if text:
-                    content_blocks.append({"type": "text", "text": text})
-    elif isinstance(content, str) and content:
-        content_blocks.append({"type": "text", "text": content})
-
-    for call in message.get("tool_calls") or []:
-        function = call.get("function") or {}
-        arguments = function.get("arguments")
-        if isinstance(arguments, str):
-            try:
-                arguments = json.loads(arguments)
-            except json.JSONDecodeError:
-                arguments = {"raw": arguments}
-        tool_calls.append(
-            {
-                "id": call.get("id"),
-                "toolName": function.get("name") or call.get("type"),
-                "arguments": arguments or {},
-            }
-        )
-
-    usage = data.get("usage") or {}
-    finish_reason = first.get("finish_reason")
-    if usage:
-        metadata["usage"] = usage
-    if finish_reason:
-        metadata["finishReason"] = finish_reason
-    if data.get("id"):
-        metadata["responseId"] = data["id"]
-    return content_blocks, tool_calls, metadata
-
-
-def _handle_echo(arguments: Dict[str, Any]) -> ToolResponse:
-    text = arguments.get("text")
-    if not isinstance(text, str):
-        return _tool_error("Invalid params: 'text' must be a string")
-    return _tool_ok(content=[{"type": "text", "text": text}])
-
-
-def _handle_read_file(arguments: Dict[str, Any]) -> ToolResponse:
-    path = arguments.get("path")
-    if not isinstance(path, str):
-        return _tool_error("Invalid params: 'path' must be a string")
-    max_bytes_raw = arguments.get("max_bytes", 200_000)
-    try:
-        max_bytes = int(max_bytes_raw)
-    except Exception:
-        return _tool_error("Invalid params: 'max_bytes' must be an integer")
-    result = _safe_read_file(path, max_bytes=max_bytes)
-    if result.get("error"):
-        return _tool_error(result["error"], metadata={"path": result.get("path")})
-    metadata = {"path": result["path"], "size": result["size"]}
-    return _tool_ok(content=[{"type": "text", "text": result["text"]}], metadata=metadata)
-
-def _handle_think(arguments: Dict[str, Any]) -> ToolResponse:
-    if not THINK_TOOL_CONFIG.enabled:
-        logger.debug("think-tool disabled in configuration")
-        return _tool_error("think-tool отключён в конфигурации.")
-    if THINK_TOOL_CLIENT is None:
-        logger.debug("think-tool client not initialised")
-        return _tool_error("think-tool недоступен: клиент не инициализирован, проверьте логи.")
-
-    logger.debug("_handle_think arguments: %s", arguments)
-    thought = arguments.get("thought")
-    if not isinstance(thought, str) or not thought.strip():
-        logger.debug("Invalid think 'thought': %s", thought)
-        return _tool_error("Invalid params: 'thought' must be a non-empty string")
-    parent_trace = arguments.get("parent_trace_id")
-    if parent_trace is not None and not isinstance(parent_trace, str):
-        logger.debug("Invalid think parent_trace_id: %s", parent_trace)
-        return _tool_error("Invalid params: 'parent_trace_id' must be a string")
-
-    try:
-        call_result = THINK_TOOL_CLIENT.capture_thought(thought, parent_trace)
-    except Exception as exc:  # pragma: no cover - сетевые ошибки фиксируются в логах
-        logger.exception("think-tool call failed")
-        return _tool_error(f"think-tool call failed: {exc}")
-
-    logger.debug("think-tool call result: %s", call_result)
-    if call_result.was_skipped:
-        return _tool_error(call_result.error or "think-tool request skipped by client")
-    if not call_result.ok:
-        metadata = {"status_code": call_result.status_code} if call_result.status_code else None
-        return _tool_error(call_result.error or "think-tool returned error", metadata=metadata)
-
-    remote_result = call_result.result or {}
-    content: Optional[List[Dict[str, Any]]] = None
-    metadata: Dict[str, Any] = {"via": "think-tool"}
-
-    if isinstance(remote_result, dict):
-        remote_content = remote_result.get("content")
-        if isinstance(remote_content, list):
-            content = [item for item in remote_content if isinstance(item, dict)]
-        if remote_result:
-            metadata["remoteResult"] = remote_result
-
-    if content is None:
-        serialized = json.dumps(remote_result, ensure_ascii=False) if remote_result else "ok"
-        content = [{"type": "text", "text": serialized}]
-
-    return _tool_ok(content=content, metadata=metadata)
-
-
-# ---- Chat tool helpers to reduce cognitive complexity ----
-class _ChatArgError(ValueError):
-    pass
-
-
-def _extract_chat_params(arguments: Dict[str, Any]) -> Dict[str, Any]:
-    model = arguments.get("model")
-    messages = arguments.get("messages")
-    if not isinstance(model, str):
-        raise _ChatArgError("Invalid params: 'model' must be a string")
-    if not isinstance(messages, list):
-        raise _ChatArgError("Invalid params: 'messages' must be an array")
-
-    return {
-        "model": model,
-        "messages": messages,
-        "temperature": float(arguments.get("temperature", 0.7)),
-        "top_p": arguments.get("top_p"),
-        "max_tokens": arguments.get("max_tokens"),
-        "metadata": arguments.get("metadata"),
-        "parallel_tool_calls": arguments.get("parallelToolCalls"),
-        "tools": arguments.get("tools"),
-        "tool_choice": arguments.get("tool_choice") or arguments.get("toolChoice"),
-    }
-
-
-def _normalize_input_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    cleaned_messages: List[Dict[str, Any]] = []
-    for msg in messages:
-        if not isinstance(msg, dict):
-            raise _ChatArgError("Invalid params: every message must be an object")
-        role = msg.get("role")
-        content = msg.get("content")
-        if not isinstance(role, str):
-            raise _ChatArgError("Invalid params: message role must be a string")
-        if isinstance(content, list):
-            cleaned = [item for item in content if isinstance(item, dict)]
-            cleaned_messages.append({"role": role, "content": cleaned})
-        else:
-            cleaned_messages.append({"role": role, "content": content})
-    return cleaned_messages
-
-
-def _build_request_payload(params: Dict[str, Any], input_messages: List[Dict[str, Any]]) -> Dict[str, Any]:
-    payload: Dict[str, Any] = {
-        "model": params["model"],
-        "input": input_messages,
-        "temperature": params["temperature"],
-    }
-    tools_param = params.get("tools")
-    tools: List[Dict[str, Any]] | None = None
-    if isinstance(tools_param, list):
-        tools = [item for item in tools_param if isinstance(item, dict)]
-        if tools:
-            payload["tools"] = tools
-    if params.get("metadata"):
-        payload["metadata"] = params["metadata"]
-    if params.get("top_p") is not None:
-        payload["top_p"] = float(params["top_p"])  # type: ignore[arg-type]
-    if params.get("max_tokens") is not None:
-        payload["max_output_tokens"] = int(params["max_tokens"])  # type: ignore[arg-type]
-    if params.get("parallel_tool_calls") is not None:
-        payload["parallel_tool_calls"] = bool(params["parallel_tool_calls"])  # type: ignore[arg-type]
-    if params.get("tool_choice") is not None:
-        payload["tool_choice"] = params["tool_choice"]
-
-    if THINK_TOOL_CONFIG.enabled:
-        think_entry = {
-            "type": "function",
-            "name": "think",
-            "description": "Capture intermediate reasoning using the external think-tool.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "thought": {
-                        "type": "string",
-                        "description": "Thought text to be persisted by think-tool.",
-                    },
-                    "parent_trace_id": {
-                        "type": "string",
-                        "description": "Optional LangSmith trace identifier.",
-                    },
-                },
-                "required": ["thought"],
-                "additionalProperties": False,
-            },
-        }
-        tools_list = payload.setdefault("tools", tools or [])
-        # Avoid дублирования, если клиент уже передал think.
-        already_present = any(
-            isinstance(entry, dict)
-            and (entry.get("function") or {}).get("name") == "think"
-            for entry in tools_list
-        )
-        if not already_present:
-            tools_list.append(think_entry)
-
-    return payload
-
-
+# === Chat tool handler ===
+# Эта функция обрабатывает вызовы MCP-инструмента "chat". На вход получает
+# словарь аргументов из JSON-RPC, валидирует его, формирует запрос к OpenAI
+# Responses API (либо совместимый слой над ним), делает начальный запрос и при
+# необходимости — дополнительные follow-up запросы (например, для think-инструмента),
+# после чего нормализует ответ к универсальному формату ToolResponse.
+# Идея: максимально изолировать контракт MCP (tools/call) от конкретики SDK OpenAI.
 def _handle_chat(arguments: Dict[str, Any]) -> ToolResponse:
+    # 1) Разбор аргументов chat-инструмента.
+    # extract_chat_params выполняет строгую валидацию и нормализацию входа
+    # (модель, сообщения, опции генерации и т.п.). Если формат неверный,
+    # выбрасывается ChatArgError и мы возвращаем ToolResponse c ошибкой.
     try:
-        params = _extract_chat_params(arguments)
-        input_messages = _normalize_input_messages(params["messages"])  # type: ignore[arg-type]
-    except _ChatArgError as exc:
+        params = extract_chat_params(arguments)
+        input_messages = normalize_input_messages(params["messages"])  # type: ignore[arg-type]
+    except ChatArgError as exc:
         return _tool_error(str(exc))
 
+    # 2) Создание адаптера клиента OpenAI.
+    # _create_openai_client оставлен для тестов/monkeypatch; адаптер добавляет
+    # ленивую инициализацию и проверку Responses API.
     try:
-        client = _create_openai_client()
+        client_adapter = OpenAIClientAdapter(client_factory=_create_openai_client)
+        client_adapter.ensure_ready()
     except RuntimeError as exc:
         return _tool_error(str(exc))
 
-    request_payload = _build_request_payload(params, input_messages)
+    # 3) Сборка полезной нагрузки для Responses API.
+    # build_request_payload приводит параметры к нужной схеме SDK/HTTP, а также
+    # при необходимости автоматически добавляет декларации инструментов (tools)
+    # и конфигурацию think-инструмента, если это включено.
+    request_payload = build_request_payload(params, input_messages, ensure_think_tool=THINK_TOOL_CONFIG.enabled)
 
-    responses_api = getattr(client, "responses", None)
-    if responses_api is None:
-        return _tool_error("OpenAI client missing Responses API.")
+    # 4) Проверяем доступность responses.retrieve — пригодится при поллинге.
+    supports_retrieve = client_adapter.can_retrieve()
 
-    create_fn = getattr(responses_api, "create", None)
-    if not callable(create_fn):
-        return _tool_error("OpenAI client does not expose responses.create; update the SDK.")
-
-    retrieve_fn = getattr(responses_api, "retrieve", None)
-
+    # 5) Инициализирующий запрос к Responses API.
+    # Засекаем время ради логов и диагностик. Любая сетевая ошибка переводится
+    # в ToolResponse c ошибкой — это позволит корректно отобразить её на стороне MCP-клиента.
     try:
         t0 = time.time()
-        initial_response = create_fn(**request_payload)
+        initial_response = client_adapter.create_response(request_payload)
         dt = (time.time() - t0) * 1000.0
         logger.info("responses.create ok in %.1f ms (model=%s, tools=%s)", dt, params["model"], bool(request_payload.get("tools")))
         response_data = _maybe_model_dump(initial_response)
@@ -679,48 +119,29 @@ def _handle_chat(arguments: Dict[str, Any]) -> ToolResponse:
         logger.exception("OpenAI Responses API call failed on create")
         return _tool_error(f"OpenAI call failed: {exc}")
 
-    poll_delay = 0.05
-    max_polls = 20
+    # Настройки опроса статуса ответа (из конфигурации):
+    #  - POLL_DELAY: пауза между попытками (сек.),
+    #  - MAX_POLLS: ограничение числа попыток, чтобы не зависнуть в ожидании.
+    poll_delay = POLL_DELAY
+    max_polls = MAX_POLLS
+    poller = ResponsePoller(
+        client_adapter,
+        poll_delay=poll_delay,
+        max_polls=max_polls,
+        semaphore=POLL_SEM,
+    )
+    think_processor = ThinkToolProcessor(_handle_think)
 
+    # 6) Вспомогательная функция опроса статуса ответа.
+    # Используется, когда первоначальный статус — queued/in_progress, или когда
+    # SDK вернул ответ без финального статуса. Реализуем аккуратный поллинг.
     def _poll_response(response_id: str, initial: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-        if not callable(retrieve_fn):
-            return initial or {}
-        # Constrain concurrent polling to keep connection pool healthy
-        acquired = POLL_SEM.acquire(timeout=5.0)
-        if not acquired:
-            logger.warning("responses.retrieve semaphore timeout — skipping poll for %s", response_id)
-            return initial or {}
-        try:
-            data = initial or {}
-            status = data.get("status")
-            if status and status not in {"queued", "in_progress"}:
-                return data
-            polls = 0
-            t_start = time.time()
-            while polls < max_polls:
-                t0 = time.time()
-                try:
-                    retrieved = retrieve_fn(response_id=response_id)
-                except TypeError:
-                    retrieved = retrieve_fn(id=response_id)  # type: ignore[call-arg]
-                dt = (time.time() - t0) * 1000.0
-                if not retrieved:
-                    logger.info("responses.retrieve empty in %.1f ms (poll=%d)", dt, polls)
-                    break
-                data = _maybe_model_dump(retrieved)
-                status = data.get("status")
-                if status and status not in {"queued", "in_progress"}:
-                    total_ms = (time.time() - t_start) * 1000.0
-                    logger.info("responses.retrieve terminal status=%s in %.1f ms after %d polls", status, total_ms, polls + 1)
-                    return data
-                polls += 1
-                time.sleep(poll_delay)
-            total_ms = (time.time() - t_start) * 1000.0
-            logger.info("responses.retrieve hit poll limit after %d polls in %.1f ms (last status=%s)", polls, total_ms, status)
-            return data
-        finally:
-            POLL_SEM.release()
+        return poller.poll(response_id, initial)
 
+    # 7) Унификация получения финального ответа.
+    # Если статус уже финальный — просто возвращаем. Если статус не указан, но
+    # есть retrieve, пытаемся дополучить данным по id. Это прячет разницу между
+    # вариантами SDK и упрощает основную логику ниже.
     def _resolve_response(payload: Dict[str, Any]) -> Dict[str, Any]:
         status = payload.get("status")
         response_id = payload.get("id")
@@ -728,37 +149,42 @@ def _handle_chat(arguments: Dict[str, Any]) -> ToolResponse:
             return payload
         if status in {"queued", "in_progress"}:
             return _poll_response(response_id, payload)
-        if status is None and callable(retrieve_fn):
+        if status is None and supports_retrieve:
             return _poll_response(response_id, payload)
         return payload
 
+    # 8) Переменные для накопления результата и промежуточного состояния:
+    #  - follow_up_data: текущий полный ответ от API,
+    #  - final_meta: финальные метаданные (id ответа и т.п.),
+    #  - think_logs: журнал выполнения think-инструмента,
+    #  - final_content: собранный контент для пользователя,
+    #  - remaining_tool_calls: вызовы инструментов, которые модель запросила, но их должен выполнить MCP-клиент.
     follow_up_data = _resolve_response(response_data)
     final_meta: Optional[Dict[str, Any]] = None
-    think_logs: List[Dict[str, Any]] = []
+    think_logs: List[ThinkLogEntry] = []
     final_content: List[Dict[str, Any]] = []
     remaining_tool_calls: List[Dict[str, Any]] = []
 
-    max_turns = 5
+    # Ограничение числа итераций (safety): если модель продолжает просить инструменты
+    # бесконечно, мы не будем крутиться вечно. Это guardrail против зацикливания.
+    max_turns = 15
     turn = 0
 
-    def _convert_think_content(blocks: Optional[List[Dict[str, Any]]]) -> str:
-        converted: List[str] = []
-        for block in blocks or []:
-            if not isinstance(block, dict):
-                continue
-            text = block.get("text")
-            if isinstance(text, str) and text.strip():
-                converted.append(text.strip())
-        if not converted:
-            return "ok"
-        return "\n\n".join(converted)
-
+    # 9) Основной цикл обработки ответа и инструментов.
+    # На каждом шаге нормализуем ответ (responses/chat-completions),
+    # проверяем, запросила ли модель инструменты, и либо завершаем,
+    # либо исполняем think и отправляем follow-up.
     while turn < max_turns:
         turn += 1
 
-        content_blocks, tool_calls, meta = _normalise_responses_output(follow_up_data)
+        # Нормализация в единый формат. Разные режимы/модели возвращают отличающиеся
+        # структуры; эти функции прячут различия и выдают:
+        #  - content_blocks: массив блоков контента (text, etc),
+        #  - tool_calls: список запросов к инструментам,
+        #  - meta: полезные метаданные (responseId, статус и пр.).
+        content_blocks, tool_calls, meta = normalise_responses_output(follow_up_data)
         if not content_blocks and not tool_calls:
-            content_blocks, tool_calls, meta = _normalise_chat_completion(follow_up_data)
+            content_blocks, tool_calls, meta = normalise_chat_completion(follow_up_data)
         if not content_blocks and not tool_calls and follow_up_data:
             content_blocks = [{"type": "text", "text": json.dumps(follow_up_data)}]
 
@@ -768,58 +194,24 @@ def _handle_chat(arguments: Dict[str, Any]) -> ToolResponse:
         if tool_calls:
             logger.info("Received tool calls: %s", tool_calls)
 
+        # Если модель не запрашивает инструменты, считаем ответ финальным и выходим.
         if not tool_calls:
             final_content = content_blocks
             remaining_tool_calls = tool_calls
             break
 
-        follow_up_inputs: List[Dict[str, Any]] = []
-        remaining_tool_calls = []
+        think_result = think_processor.process(tool_calls)
+        think_logs.extend(think_result.think_logs)
+        remaining_tool_calls = think_result.remaining_calls
+        follow_up_inputs = think_result.follow_up_inputs
 
-        for call in tool_calls:
-            if call.get("toolName") != "think":
-                remaining_tool_calls.append(call)
-                continue
-
-            logger.info("Processing think tool call: %s", call)
-            arguments = call.get("arguments") or {}
-            if not isinstance(arguments, dict):
-                arguments = {"raw": arguments}
-
-            think_result = _handle_think(arguments)
-            think_logs.append(
-                {
-                    "callId": call.get("id"),
-                    "status": "error" if think_result.get("isError") else "ok",
-                    "result": think_result,
-                }
+        if think_result.is_error():
+            error_response = ProcessingResult(
+                think_logs=think_logs,
+                error_message=think_result.error_message,
+                error_metadata=think_result.error_metadata,
             )
-
-            if think_result.get("isError"):
-                error_blocks = think_result.get("content") or [{"type": "text", "text": "think-tool returned error"}]
-                error_texts = []
-                for block in error_blocks:
-                    if isinstance(block, dict) and isinstance(block.get("text"), str):
-                        error_texts.append(block["text"])
-                message = "\n".join(error_texts) or "think-tool returned error"
-                return _tool_error(message, metadata=think_result.get("metadata"))
-
-            tool_call_id = call.get("id")
-            if not isinstance(tool_call_id, str) or not tool_call_id:
-                return _tool_error("Invalid think-tool call identifier.")
-
-            follow_up_inputs.append(
-                {
-                    "type": "function_call_output",
-                    "call_id": tool_call_id,
-                    "output": [
-                        {
-                            "type": "input_text",
-                            "text": _convert_think_content(think_result.get("content")),
-                        }
-                    ],
-                }
-            )
+            return error_response.to_tool_response()
 
         if follow_up_inputs:
             logger.info("Prepared function_call_output payloads: %s", follow_up_inputs)
@@ -828,6 +220,8 @@ def _handle_chat(arguments: Dict[str, Any]) -> ToolResponse:
             final_content = content_blocks
             break
 
+        # Чтобы сделать follow-up, нам нужен response_id предыдущего ответа. Берём его
+        # из meta/финального meta/или из самого payload — в зависимости от того, что вернул SDK.
         response_id = (
             (meta or {}).get("responseId")
             or (final_meta or {}).get("responseId")
@@ -837,6 +231,8 @@ def _handle_chat(arguments: Dict[str, Any]) -> ToolResponse:
             final_content = content_blocks
             break
 
+        # 11) Формируем follow-up запрос: передаём модель, previous_response_id и input
+        # (результаты think). По возможности передаём и metadata, чтобы сохранить связность.
         try:
             follow_up_payload: Dict[str, Any] = {
                 "model": params["model"],
@@ -848,7 +244,7 @@ def _handle_chat(arguments: Dict[str, Any]) -> ToolResponse:
 
             logger.info("Sending OpenAI follow-up: %s", follow_up_payload)
             t1 = time.time()
-            follow_up = create_fn(**follow_up_payload)
+            follow_up = client_adapter.create_response(follow_up_payload)
             dt1 = (time.time() - t1) * 1000.0
             logger.info("responses.create (follow-up) ok in %.1f ms", dt1)
             follow_up_data = _resolve_response(_maybe_model_dump(follow_up))
@@ -860,19 +256,14 @@ def _handle_chat(arguments: Dict[str, Any]) -> ToolResponse:
     else:  # pragma: no cover - guardrail
         return _tool_error("Reached maximum tool iterations without completion.")
 
-    result = _tool_ok(content=final_content, tool_calls=remaining_tool_calls, metadata=final_meta or None)
-    if think_logs:
-        metadata = result.setdefault("metadata", {})
-        metadata["thinkTool"] = [
-            {
-                "callId": log.get("callId"),
-                "status": log.get("status"),
-                "content": log.get("result", {}).get("content"),
-                "metadata": log.get("result", {}).get("metadata"),
-            }
-            for log in think_logs
-        ]
-    return result
+    # 12) Сборка итогового ToolResponse: контент + (неисполненные) tool_calls + метаданные.
+    processing_result = ProcessingResult(
+        content=final_content,
+        tool_calls=remaining_tool_calls,
+        metadata=final_meta or None,
+        think_logs=think_logs,
+    )
+    return processing_result.to_tool_response()
 
 
 TOOL_HANDLERS: Dict[str, ToolHandler] = {
@@ -908,136 +299,5 @@ if THINK_TOOL_CONFIG.enabled:
     )
     TOOL_HANDLERS["think"] = _handle_think
 
-
-# =========================
-# RPC method handlers (extracted to reduce cognitive complexity in mcp_rpc)
-# =========================
-async def _handle_initialize(params: Dict[str, Any], request_id: Any) -> JsonRpcResponse | JsonRpcError:
-    try:
-        parsed = InitializeParams.model_validate(params)
-    except ValidationError as exc:
-        return _json_rpc_error(-32602, "Invalid initialize params", data=exc.errors(), request_id=request_id)
-
-    session_id = str(uuid4())
-    ACTIVE_SESSIONS[session_id] = SessionState(
-        id=session_id,
-        client_info=parsed.clientInfo,
-        capabilities=parsed.capabilities,
-    )
-    result = {
-        "protocolVersion": PROTOCOL_VERSION,
-        "serverInfo": SERVER_INFO,
-        "capabilities": SERVER_CAPABILITIES,
-        "sessionId": session_id,
-    }
-    return JsonRpcResponse(result=result, id=request_id)
-
-async def _handle_ping(params: Dict[str, Any], request_id: Any) -> JsonRpcResponse | JsonRpcError:
-    try:
-        session = _require_session(params)
-    except McpSessionError as exc:
-        return _json_rpc_error(exc.code, str(exc), data=exc.data, request_id=request_id)
-    return JsonRpcResponse(result={"sessionId": session.id}, id=request_id)
-
-async def _handle_shutdown(params: Dict[str, Any], request_id: Any) -> JsonRpcResponse:
-    session_id = params.get("sessionId")
-    if isinstance(session_id, str):
-        ACTIVE_SESSIONS.pop(session_id, None)
-    return JsonRpcResponse(result={}, id=request_id)
-
-async def _handle_tools_list(params: Dict[str, Any], request_id: Any) -> JsonRpcResponse | JsonRpcError:
-    try:
-        _require_session(params)
-    except McpSessionError as exc:
-        return _json_rpc_error(exc.code, str(exc), data=exc.data, request_id=request_id)
-    result = {
-        "tools": [spec.as_mcp_dict() for spec in TOOLS.values()],
-        "nextCursor": None,
-    }
-    return JsonRpcResponse(result=result, id=request_id)
-
-async def _handle_tools_call(params: Dict[str, Any], request_id: Any) -> JsonRpcResponse | JsonRpcError:
-    try:
-        _require_session(params)
-    except McpSessionError as exc:
-        return _json_rpc_error(exc.code, str(exc), data=exc.data, request_id=request_id)
-
-    name = params.get("name")
-    arguments = params.get("arguments") or {}
-    if not isinstance(name, str) or name not in TOOL_HANDLERS:
-        return _json_rpc_error(
-            -32601,
-            "Tool not found",
-            data={"available": list(TOOL_HANDLERS.keys())},
-            request_id=request_id,
-        )
-    if not isinstance(arguments, dict):
-        return _json_rpc_error(
-            -32602,
-            "Invalid params: 'arguments' must be an object",
-            request_id=request_id,
-        )
-    handler = TOOL_HANDLERS[name]
-    result = handler(arguments)
-    return JsonRpcResponse(result=result, id=request_id)
-
-async def _handle_legacy(params: Dict[str, Any], method: str, request_id: Any) -> JsonRpcResponse:
-    legacy_arguments = params if isinstance(params, dict) else {}
-    if method == "tools.echo":
-        return JsonRpcResponse(result=_handle_echo(legacy_arguments), id=request_id)
-    if method == "tools.read_file":
-        return JsonRpcResponse(result=_handle_read_file(legacy_arguments), id=request_id)
-    # Fallback should not occur due to caller checks; return method not found to be safe
-    return JsonRpcResponse(result=_tool_error("Legacy method not supported"), id=request_id)
-
-# =========================
-# FastAPI routes
-# =========================
-@app.get("/health")
-async def health() -> Dict[str, str]:
-    return {"status": "ok"}
-
-
-@app.get("/mcp")
-async def mcp_info() -> Dict[str, Any]:
-    return {
-        "protocolVersion": PROTOCOL_VERSION,
-        "capabilities": SERVER_CAPABILITIES,
-        "transport": {"type": "http", "endpoint": "/mcp"},
-    }
-
-
-@app.post("/mcp")
-async def mcp_rpc(req: JsonRpcRequest):
-    method = req.method
-    params = req.params or {}
-
-    try:
-        # Fast path dispatch table
-        if method == "initialize":
-            return await _handle_initialize(params, req.id)
-        if method == "ping":
-            return await _handle_ping(params, req.id)
-        if method == "shutdown":
-            return await _handle_shutdown(params, req.id)
-        if method == "tools/list":
-            return await _handle_tools_list(params, req.id)
-        if method == "tools/call":
-            return await _handle_tools_call(params, req.id)
-
-        # Optional legacy methods support
-        if ENABLE_LEGACY_METHODS and method in {"tools.echo", "tools.read_file"}:
-            return await _handle_legacy(params, method, req.id)
-
-        return _json_rpc_error(
-            -32601,
-            "Method not found",
-            data={"method": method},
-            request_id=req.id,
-        )
-
-    except McpSessionError as exc:
-        return _json_rpc_error(exc.code, str(exc), data=exc.data, request_id=req.id)
-    except Exception as exc:  # pragma: no cover
-        logger.exception("Unhandled MCP error")
-        return _json_rpc_error(-32603, "Internal error", data=str(exc), request_id=req.id)
+configure_routes(tool_handlers=TOOL_HANDLERS, tools=TOOLS)
+app.include_router(api_router)

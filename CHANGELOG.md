@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- Рефакторили структуру приложения: вынесли JSON-RPC маршруты в `app/api/routes.py`, переработали `app/main.py` и обновили README под новую архитектуру.
+- Продолжили декомпозицию `_handle_chat`: добавили `OpenAIClientAdapter`, `ResponsePoller`, вынесли think-цикл в `ThinkToolProcessor`, оформили результат в дата-классы (`ProcessingResult`, `ThinkProcessResult`) и расширили тестовое покрытие (`tests/test_mcp_router.py`).
+
 ## v0.0.2 (2025-10-19)
 
 - Добавил поддержку codex и файл AGENTS.md
