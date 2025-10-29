@@ -6,6 +6,7 @@
 """
 from __future__ import annotations
 
+import copy
 import json
 import logging
 import time
@@ -41,6 +42,7 @@ from .services.openai_responses import (
     normalise_responses_output,
     normalize_input_messages,
 )
+from .services.langsmith_tracing import create_langsmith_tracer
 from .services.chat_processing import ProcessingResult
 from .services.think_processor import ThinkLogEntry, ThinkToolProcessor
 from .think_client import ThinkToolConfig
@@ -78,6 +80,18 @@ app = FastAPI(title="MCP - OpenAI Router", version="0.0.2")
 # после чего нормализует ответ к универсальному формату ToolResponse.
 # Идея: максимально изолировать контракт MCP (tools/call) от конкретики SDK OpenAI.
 def _handle_chat(arguments: Dict[str, Any]) -> ToolResponse:
+    raw_metadata = arguments.get("metadata") if isinstance(arguments, dict) else None
+    if isinstance(raw_metadata, dict):
+        metadata_for_tracer: Optional[Dict[str, Any]] = raw_metadata
+    else:
+        metadata_for_tracer = None
+    try:
+        tracer_inputs = {"arguments": copy.deepcopy(arguments)}
+    except Exception:
+        tracer_inputs = {"arguments": arguments}
+    tracer = create_langsmith_tracer(metadata_for_tracer)
+    tracer.start(tracer_inputs)
+
     # 1) Разбор аргументов chat-инструмента.
     # extract_chat_params выполняет строгую валидацию и нормализацию входа
     # (модель, сообщения, опции генерации и т.п.). Если формат неверный,
@@ -86,7 +100,8 @@ def _handle_chat(arguments: Dict[str, Any]) -> ToolResponse:
         params = extract_chat_params(arguments)
         input_messages = normalize_input_messages(params["messages"])  # type: ignore[arg-type]
     except ChatArgError as exc:
-        return _tool_error(str(exc))
+        response = _tool_error(str(exc))
+        return tracer.finalize_error(response, message=str(exc))
 
     # 2) Создание адаптера клиента OpenAI.
     # _create_openai_client оставлен для тестов/monkeypatch; адаптер добавляет
@@ -95,7 +110,9 @@ def _handle_chat(arguments: Dict[str, Any]) -> ToolResponse:
         client_adapter = OpenAIClientAdapter(client_factory=_create_openai_client)
         client_adapter.ensure_ready()
     except RuntimeError as exc:
-        return _tool_error(str(exc))
+        message = str(exc)
+        response = _tool_error(message)
+        return tracer.finalize_error(response, message=message)
 
     # 3) Сборка полезной нагрузки для Responses API.
     # build_request_payload приводит параметры к нужной схеме SDK/HTTP, а также
@@ -117,7 +134,9 @@ def _handle_chat(arguments: Dict[str, Any]) -> ToolResponse:
         response_data = _maybe_model_dump(initial_response)
     except Exception as exc:  # pragma: no cover - network failures
         logger.exception("OpenAI Responses API call failed on create")
-        return _tool_error(f"OpenAI call failed: {exc}")
+        message = f"OpenAI call failed: {exc}"
+        response = _tool_error(message)
+        return tracer.finalize_error(response, message=message)
 
     # Настройки опроса статуса ответа (из конфигурации):
     #  - POLL_DELAY: пауза между попытками (сек.),
@@ -211,7 +230,9 @@ def _handle_chat(arguments: Dict[str, Any]) -> ToolResponse:
                 error_message=think_result.error_message,
                 error_metadata=think_result.error_metadata,
             )
-            return error_response.to_tool_response()
+            error_payload = error_response.to_tool_response()
+            error_text = think_result.error_message or "think-tool returned error"
+            return tracer.finalize_error(error_payload, message=error_text)
 
         if follow_up_inputs:
             logger.info("Prepared function_call_output payloads: %s", follow_up_inputs)
@@ -252,9 +273,13 @@ def _handle_chat(arguments: Dict[str, Any]) -> ToolResponse:
                 follow_up_data["id"] = response_id
         except Exception as exc:  # pragma: no cover - network failures
             logger.exception("OpenAI follow-up call failed")
-            return _tool_error(f"OpenAI follow-up call failed: {exc}")
+            message = f"OpenAI follow-up call failed: {exc}"
+            response = _tool_error(message)
+            return tracer.finalize_error(response, message=message)
     else:  # pragma: no cover - guardrail
-        return _tool_error("Reached maximum tool iterations without completion.")
+        message = "Reached maximum tool iterations without completion."
+        response = _tool_error(message)
+        return tracer.finalize_error(response, message=message)
 
     # 12) Сборка итогового ToolResponse: контент + (неисполненные) tool_calls + метаданные.
     processing_result = ProcessingResult(
@@ -263,7 +288,11 @@ def _handle_chat(arguments: Dict[str, Any]) -> ToolResponse:
         metadata=final_meta or None,
         think_logs=think_logs,
     )
-    return processing_result.to_tool_response()
+    result_response = processing_result.to_tool_response()
+    if processing_result.is_error():
+        error_message = processing_result.error_message or "Processing failed"
+        return tracer.finalize_error(result_response, message=error_message)
+    return tracer.finalize_success(result_response)
 
 
 TOOL_HANDLERS: Dict[str, ToolHandler] = {

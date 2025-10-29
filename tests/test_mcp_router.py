@@ -321,3 +321,105 @@ def test_chat_returns_error_with_think_logs(monkeypatch: pytest.MonkeyPatch) -> 
     assert think_logs[0]["callId"] == think_call_id
     assert think_logs[0]["status"] == "error"
     assert metadata.get("reason") == "mock"
+
+
+def test_chat_records_langsmith_run(monkeypatch: pytest.MonkeyPatch) -> None:
+    payload = {
+        "id": "resp_ls",
+        "status": "completed",
+        "output": [
+            {
+                "type": "message",
+                "role": "assistant",
+                "content": [
+                    {"type": "output_text", "text": "Ответ с трассировкой."},
+                ],
+            }
+        ],
+    }
+    dummy_client = DummyOpenAIClient(payload)
+    monkeypatch.setattr(mcp, "_create_openai_client", lambda: dummy_client)
+
+    import app.services.langsmith_tracing as tracing
+
+    class DummyLangSmithClient:
+        def __init__(self) -> None:
+            self.created = []
+            self.updated = []
+
+        def create_run(self, **kwargs: Any) -> str:
+            self.created.append(kwargs)
+            return kwargs.get("id") or "run-stub"
+
+        def update_run(self, run_id: str, **kwargs: Any) -> None:
+            self.updated.append((run_id, kwargs))
+
+    stub_client = DummyLangSmithClient()
+    monkeypatch.setattr(tracing, "_CLIENT_CACHE", None)
+    monkeypatch.setattr(tracing, "_CLIENT_FAILED", False)
+    monkeypatch.setattr(tracing, "_get_langsmith_client", lambda: stub_client)
+
+    client = TestClient(mcp.app)
+
+    init_response = client.post(
+        "/mcp",
+        json={
+            "jsonrpc": "2.0",
+            "id": 20,
+            "method": "initialize",
+            "params": {
+                "clientInfo": {"name": "pytest", "version": "1.0"},
+                "capabilities": {},
+            },
+        },
+    )
+    assert init_response.status_code == 200
+    session_id = init_response.json()["result"]["sessionId"]
+
+    response = client.post(
+        "/mcp",
+        json={
+            "jsonrpc": "2.0",
+            "id": 21,
+            "method": "tools/call",
+            "params": {
+                "sessionId": session_id,
+                "name": "chat",
+                "arguments": {
+                    "model": "gpt-langsmith",
+                    "messages": [
+                        {"role": "user", "content": "Включи трассу."},
+                    ],
+                    "metadata": {
+                        "langsmith": {
+                            "parent_run_id": "parent-001",
+                            "trace_id": "trace-xyz",
+                            "project": "proj-test",
+                            "tags": ["unit-test"],
+                        }
+                    },
+                },
+            },
+        },
+    )
+    assert response.status_code == 200
+    result = response.json()["result"]
+    assert result["isError"] is False
+
+    langsmith_meta = (result.get("metadata") or {}).get("langsmith") or {}
+    assert langsmith_meta.get("parentRunId") == "parent-001"
+    assert langsmith_meta.get("project") == "proj-test"
+    assert langsmith_meta.get("traceId") == "trace-xyz"
+
+    assert stub_client.created, "LangSmith run was not created"
+    created_kwargs = stub_client.created[0]
+    run_id = created_kwargs.get("id")
+    assert created_kwargs.get("parent_run_id") == "parent-001"
+    assert created_kwargs.get("trace_id") == "trace-xyz"
+    assert created_kwargs.get("project_name") == "proj-test"
+    assert created_kwargs.get("tags") == ["unit-test"]
+
+    assert stub_client.updated, "LangSmith run was not finalized"
+    updated_run_id, update_payload = stub_client.updated[0]
+    assert updated_run_id == run_id
+    assert "response" in update_payload.get("outputs", {})
