@@ -415,11 +415,17 @@ def test_chat_records_langsmith_run(monkeypatch: pytest.MonkeyPatch) -> None:
     created_kwargs = stub_client.created[0]
     run_id = created_kwargs.get("id")
     assert created_kwargs.get("parent_run_id") == "parent-001"
-    assert created_kwargs.get("trace_id") == "trace-xyz"
+    # trace_id не передаётся при наличии parent_run_id (наследуется автоматически)
+    assert "trace_id" not in created_kwargs
     assert created_kwargs.get("project_name") == "proj-test"
     assert created_kwargs.get("tags") == ["unit-test"]
+    assert created_kwargs.get("run_type") == "llm"  # LLM run для корректного отображения
 
     assert stub_client.updated, "LangSmith run was not finalized"
     updated_run_id, update_payload = stub_client.updated[0]
     assert updated_run_id == run_id
-    assert "response" in update_payload.get("outputs", {})
+    outputs = update_payload.get("outputs", {})
+    assert "response" in outputs
+    # Проверяем, что есть текстовый output для UI LangSmith
+    assert "output" in outputs
+    assert "Ответ с трассировкой." in outputs["output"]

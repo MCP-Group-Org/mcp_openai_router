@@ -83,7 +83,7 @@ class LangSmithContext:
     dotted_order: Optional[str] = None
     project: Optional[str] = None
     run_name: str = "mcp_openai_router.chat"
-    run_type: str = "tool"
+    run_type: str = "llm"  # LLM run type для корректного отображения в LangSmith
     tags: List[str] = field(default_factory=list)
     metadata: Dict[str, Any] = field(default_factory=dict)
     force_enable: bool = False
@@ -258,7 +258,18 @@ class LangSmithTracer:
 
     def finalize_success(self, response: Dict[str, Any]) -> Dict[str, Any]:
         response = self.attach_to_response(response)
-        self._update_run(outputs={"response": response})
+        # Извлекаем content для лучшего отображения в LangSmith
+        content_blocks = response.get("content", [])
+        outputs = {"response": response}
+        if content_blocks and isinstance(content_blocks, list):
+            # Добавляем текстовый вывод для UI LangSmith
+            text_parts = []
+            for block in content_blocks:
+                if isinstance(block, dict) and block.get("type") == "text":
+                    text_parts.append(block.get("text", ""))
+            if text_parts:
+                outputs["output"] = "\n".join(text_parts)
+        self._update_run(outputs=outputs)
         return response
 
     def finalize_error(self, response: Dict[str, Any], *, message: str) -> Dict[str, Any]:
