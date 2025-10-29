@@ -11,12 +11,20 @@ from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, List, Optional
 
 # SDK может отсутствовать в окружении — обрабатываем мягко.
+_LANGSMITH_SDK_LOADED = False
+_LANGSMITH_SDK_ERROR = ""
+
 try:  # pragma: no cover - ветка зависит от внешней зависимости
     from langsmith import Client  # type: ignore
-except Exception:  # pragma: no cover - минимизируем влияние на основной код
+    _LANGSMITH_SDK_LOADED = True
+except Exception as exc:  # pragma: no cover - минимизируем влияние на основной код
     Client = None  # type: ignore[assignment]
+    _LANGSMITH_SDK_ERROR = str(exc)
 
 logger = logging.getLogger("mcp_openai_router.services.langsmith_tracing")
+
+if not _LANGSMITH_SDK_LOADED:
+    logger.warning("LangSmith SDK failed to load: %s", _LANGSMITH_SDK_ERROR)
 
 
 def _truthy(value: Optional[str]) -> bool:
@@ -72,6 +80,7 @@ class LangSmithContext:
     parent_run_id: Optional[str] = None
     trace_id: Optional[str] = None
     run_id: Optional[str] = None
+    dotted_order: Optional[str] = None
     project: Optional[str] = None
     run_name: str = "mcp_openai_router.chat"
     run_type: str = "tool"
@@ -103,6 +112,10 @@ def _extract_context(raw_metadata: Optional[Dict[str, Any]]) -> LangSmithContext
         _coerce_str(nested_dict.get("run_id"))
         or _coerce_str(raw_metadata.get("langsmith_run_id"))
     )
+    context.dotted_order = (
+        _coerce_str(nested_dict.get("dotted_order"))
+        or _coerce_str(raw_metadata.get("langsmith_dotted_order"))
+    )
     context.project = (
         _coerce_str(nested_dict.get("project"))
         or _coerce_str(raw_metadata.get("langsmith_project"))
@@ -127,6 +140,7 @@ def _get_langsmith_client() -> Optional[Any]:
     if _CLIENT_CACHE is not None:
         return _CLIENT_CACHE
     if Client is None:  # pragma: no cover - отсутствие SDK
+        logger.warning("LangSmith SDK not available")
         _CLIENT_FAILED = True
         return None
     try:
@@ -179,8 +193,13 @@ class LangSmithTracer:
             create_kwargs["project_name"] = self.project_name
         if self.context.parent_run_id:
             create_kwargs["parent_run_id"] = self.context.parent_run_id
-        if self.trace_id:
+            # Если есть parent_run_id, trace_id наследуется автоматически
+            # НЕ передаём trace_id вручную, чтобы избежать требования dotted_order
+        elif self.trace_id:
+            # Только для root run без родителя
             create_kwargs["trace_id"] = self.trace_id
+        if self.context.dotted_order:
+            create_kwargs["dotted_order"] = self.context.dotted_order
         if self.context.tags:
             create_kwargs["tags"] = self.context.tags
         if self.context.metadata:

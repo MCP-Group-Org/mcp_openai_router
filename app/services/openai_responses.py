@@ -8,6 +8,8 @@ import os
 import time
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
+from ..utils.metadata import deserialise_metadata_from_openai, serialise_metadata_for_openai
+
 logger = logging.getLogger("mcp_openai_router.services.openai_responses")
 
 try:
@@ -176,7 +178,6 @@ def maybe_model_dump(value: Any) -> Dict[str, Any]:
     except Exception:
         return {}
 
-
 def convert_tool_call_block(block: Dict[str, Any]) -> Dict[str, Any]:
     """Нормализует блок tool_call из ответа OpenAI."""
     arguments = block.get("arguments")
@@ -236,6 +237,9 @@ def normalise_responses_output(data: Dict[str, Any]) -> Tuple[List[Dict[str, Any
         metadata["finishReason"] = finish_reason
     if data.get("id"):
         metadata["responseId"] = data["id"]
+        provider_md = data.get("metadata")
+    if isinstance(provider_md, dict):
+        metadata["metadata"] = deserialise_metadata_from_openai(provider_md)
     return content_blocks, tool_calls, metadata
 
 
@@ -344,6 +348,7 @@ def build_request_payload(
         "input": input_messages,
         "temperature": params["temperature"],
     }
+    
     tools_param = params.get("tools")
     tools: List[Dict[str, Any]] | None = None
     if isinstance(tools_param, list):
@@ -351,7 +356,7 @@ def build_request_payload(
         if tools:
             payload["tools"] = tools
     if params.get("metadata"):
-        payload["metadata"] = params["metadata"]
+        payload["metadata"] = serialise_metadata_for_openai(params["metadata"])  # edge-serialisation
     if params.get("top_p") is not None:
         payload["top_p"] = float(params["top_p"])  # type: ignore[arg-type]
     if params.get("max_tokens") is not None:
@@ -396,6 +401,8 @@ def build_request_payload(
 
 __all__ = [
     "ChatArgError",
+    "OpenAIClientAdapter",
+    "ResponsePoller",
     "build_request_payload",
     "convert_tool_call_block",
     "create_openai_client",

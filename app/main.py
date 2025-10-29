@@ -42,6 +42,7 @@ from .services.openai_responses import (
     normalise_responses_output,
     normalize_input_messages,
 )
+from .utils.metadata import serialise_metadata_for_openai
 from .services.langsmith_tracing import create_langsmith_tracer
 from .services.chat_processing import ProcessingResult
 from .services.think_processor import ThinkLogEntry, ThinkToolProcessor
@@ -261,7 +262,7 @@ def _handle_chat(arguments: Dict[str, Any]) -> ToolResponse:
                 "input": follow_up_inputs,
             }
             if params.get("metadata"):
-                follow_up_payload["metadata"] = params["metadata"]
+                follow_up_payload["metadata"] = serialise_metadata_for_openai(params["metadata"])
 
             logger.info("Sending OpenAI follow-up: %s", follow_up_payload)
             t1 = time.time()
