@@ -180,6 +180,17 @@ class LangSmithTracer:
 
         if self.run_id is None:
             self.run_id = str(uuid.uuid4())
+
+        # Исправление: сбросить trace_id если parent_run_id отсутствует
+        # LangSmith требует dotted_order когда trace_id передается без parent_run_id
+        if self.trace_id and not self.context.parent_run_id and not self.context.dotted_order:
+            logger.debug(
+                "Resetting trace_id=%s because parent_run_id and dotted_order are missing. "
+                "LangSmith requires dotted_order when trace_id is provided without parent_run_id.",
+                self.trace_id
+            )
+            self.trace_id = None
+
         if self.trace_id is None and not self.context.parent_run_id:
             self.trace_id = str(uuid.uuid4())
 
