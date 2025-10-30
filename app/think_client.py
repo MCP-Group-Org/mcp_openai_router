@@ -137,9 +137,10 @@ class ThinkToolClient:
             "stream": False,
         }
 
-        # Добавляем metadata для LangSmith трассировки
+        # Добавляем metadata для LangSmith трассировки в arguments
+        # FastMCP не предоставляет доступ к params.metadata, поэтому передаём через arguments
         if langsmith_metadata:
-            params["metadata"] = langsmith_metadata
+            params["arguments"]["metadata"] = langsmith_metadata
 
         payload = {
             "jsonrpc": "2.0",
