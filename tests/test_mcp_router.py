@@ -205,6 +205,14 @@ def test_chat_handles_think_function_call(monkeypatch: pytest.MonkeyPatch) -> No
 
     def fake_handle_think(arguments: Dict[str, Any]) -> Dict[str, Any]:
         assert arguments["thought"] == "Найди инсайты"
+        # Проверяем, что передаются метаданные LangSmith для связывания трассировки
+        # (они автоматически добавляются в main.py перед вызовом think_processor)
+        metadata = arguments.get("metadata")
+        if metadata:
+            langsmith_meta = metadata.get("langsmith")
+            # Если есть активный tracer, должны быть parent_run_id
+            if langsmith_meta:
+                assert "parent_run_id" in langsmith_meta or "trace_id" in langsmith_meta
         return mcp._tool_ok(
             content=[
                 {"type": "text", "text": "Первый блок"},

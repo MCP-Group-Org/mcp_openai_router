@@ -116,8 +116,15 @@ def _handle_think(arguments: Dict[str, Any]) -> ToolResponse:
         logger.debug("Invalid think parent_trace_id: %s", parent_trace)
         return _tool_error("Invalid params: 'parent_trace_id' must be a string")
 
+    # Извлекаем metadata для передачи в think-tool (для LangSmith трассировки)
+    langsmith_metadata = arguments.get("metadata")
+    if langsmith_metadata is not None and not isinstance(langsmith_metadata, dict):
+        langsmith_metadata = None
+
     try:
-        call_result = THINK_TOOL_CLIENT.capture_thought(thought, parent_trace)
+        call_result = THINK_TOOL_CLIENT.capture_thought(
+            thought, parent_trace, langsmith_metadata=langsmith_metadata
+        )
     except Exception as exc:  # pragma: no cover - сетевые ошибки фиксируются в логах
         logger.exception("think-tool call failed")
         return _tool_error(f"think-tool call failed: {exc}")

@@ -96,11 +96,23 @@ class ThinkToolClient:
     def close(self) -> None:
         self._client.close()
 
-    def capture_thought(self, thought: str, parent_trace_id: Optional[str] = None) -> ThinkCallResult:
-        """Отправить мысль в think-tool. Возвращает нормализованный ответ."""
+    def capture_thought(
+        self,
+        thought: str,
+        parent_trace_id: Optional[str] = None,
+        langsmith_metadata: Optional[Dict[str, Any]] = None,
+    ) -> ThinkCallResult:
+        """Отправить мысль в think-tool. Возвращает нормализованный ответ.
+
+        Args:
+            thought: Текст мысли для сохранения
+            parent_trace_id: ID родительского trace (deprecated, используйте langsmith_metadata)
+            langsmith_metadata: Метаданные LangSmith для связывания с parent trace
+        """
         logger.debug("capture_thought enabled=%s url=%s", self._config.enabled, self._config.url)
         logger.debug("capture_thought thought=%s", thought)
         logger.debug("capture_thought parent_trace_id=%s", parent_trace_id)
+        logger.debug("capture_thought langsmith_metadata=%s", langsmith_metadata)
         if not self._config.enabled:
             logger.debug("capture_thought skipped (disabled config)")
             return ThinkCallResult.skipped("think-tool отключён конфигурацией.")
@@ -116,18 +128,24 @@ class ThinkToolClient:
             logger.warning("Не удалось выполнить handshake с think-tool: %s", exc)
             return ThinkCallResult(ok=False, error=str(exc))
 
+        params: Dict[str, Any] = {
+            "name": "think",
+            "arguments": {
+                "thought": thought,
+                "parent_trace_id": parent_trace_id,
+            },
+            "stream": False,
+        }
+
+        # Добавляем metadata для LangSmith трассировки
+        if langsmith_metadata:
+            params["metadata"] = langsmith_metadata
+
         payload = {
             "jsonrpc": "2.0",
             "id": f"think-{uuid4().hex}",
             "method": "tools/call",
-            "params": {
-                "name": "think",
-                "arguments": {
-                    "thought": thought,
-                    "parent_trace_id": parent_trace_id,
-                },
-                "stream": False,
-            },
+            "params": params,
         }
 
         try:

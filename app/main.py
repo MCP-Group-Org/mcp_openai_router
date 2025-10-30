@@ -220,6 +220,29 @@ def _handle_chat(arguments: Dict[str, Any]) -> ToolResponse:
             remaining_tool_calls = tool_calls
             break
 
+        # Обогащаем think tool calls метаданными LangSmith для связывания трассировки
+        if tracer.run_id or tracer.trace_id:
+            for call in tool_calls:
+                if call.get("toolName") == "think":
+                    # Добавляем metadata с информацией о текущем run для правильной иерархии
+                    arguments = call.get("arguments", {})
+                    if isinstance(arguments, dict):
+                        metadata = arguments.get("metadata", {})
+                        if not isinstance(metadata, dict):
+                            metadata = {}
+
+                        # Формируем langsmith metadata для дочернего run
+                        langsmith_meta = {
+                            "parent_run_id": tracer.run_id,
+                            "trace_id": tracer.trace_id,
+                            "project": tracer.project_name,
+                        }
+                        if tracer.context.tags:
+                            langsmith_meta["tags"] = tracer.context.tags
+
+                        metadata["langsmith"] = langsmith_meta
+                        arguments["metadata"] = metadata
+
         think_result = think_processor.process(tool_calls)
         think_logs.extend(think_result.think_logs)
         remaining_tool_calls = think_result.remaining_calls
