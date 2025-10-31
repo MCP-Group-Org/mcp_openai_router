@@ -15,19 +15,48 @@ logger = logging.getLogger("mcp_openai_router.services.openai_responses")
 try:
     # Опциональная зависимость во время выполнения; в тестах фабрику можно замокать.
     from openai import OpenAI
+    import httpx
 except Exception:  # pragma: no cover
     OpenAI = None  # type: ignore[assignment]
+    httpx = None  # type: ignore[assignment]
 
 
 def create_openai_client() -> Any:
     """Создаёт клиент OpenAI, используя переменные окружения."""
     if OpenAI is None:
         raise RuntimeError("OpenAI SDK not available. Install the 'openai' package.")
+    if httpx is None:
+        raise RuntimeError("httpx not available. Install the 'httpx' package.")
+
     api_key = os.getenv("OPENAI_API_KEY")
     if not api_key:
         raise RuntimeError("Missing OPENAI_API_KEY env var")
+
     base_url = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
-    return OpenAI(api_key=api_key, base_url=base_url)
+
+    # Настройка таймаутов для HTTP-клиента
+    timeout_connect = float(os.getenv("OPENAI_TIMEOUT_CONNECT", "10.0"))
+    timeout_read = float(os.getenv("OPENAI_TIMEOUT_READ", "120.0"))
+    timeout_write = float(os.getenv("OPENAI_TIMEOUT_WRITE", "30.0"))
+    timeout_pool = float(os.getenv("OPENAI_TIMEOUT_POOL", "10.0"))
+
+    timeout = httpx.Timeout(
+        connect=timeout_connect,
+        read=timeout_read,
+        write=timeout_write,
+        pool=timeout_pool,
+    )
+
+    logger.info(
+        "Создание OpenAI клиента: base_url=%s, timeouts(connect=%.1fs, read=%.1fs, write=%.1fs, pool=%.1fs)",
+        base_url,
+        timeout_connect,
+        timeout_read,
+        timeout_write,
+        timeout_pool,
+    )
+
+    return OpenAI(api_key=api_key, base_url=base_url, timeout=timeout)
 
 
 class OpenAIClientAdapter:

@@ -8,7 +8,11 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PIP_NO_CACHE_DIR=off \
     UVICORN_WORKERS=1 \
     APP_MODULE=app.main:app \
-    OPENAI_BASE_URL=https://api.openai.com/v1
+    OPENAI_BASE_URL=https://api.openai.com/v1 \
+    OPENAI_TIMEOUT_CONNECT=10.0 \
+    OPENAI_TIMEOUT_READ=120.0 \
+    OPENAI_TIMEOUT_WRITE=30.0 \
+    OPENAI_TIMEOUT_POOL=10.0
 
 # Пакеты и юзер
 RUN apt-get update && apt-get install -y --no-install-recommends \
