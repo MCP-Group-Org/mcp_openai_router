@@ -18,9 +18,9 @@ Project usage documentation and guidance are described in README.md. Follow it, 
 
 ## Priority 2. Planning and Execution
 
-- Every task begins with a `[task_name].md` file that captures the description, proposed approach, and a checklist with pause points for tests, analysis, or commits.
+- Every task begins with a `[task_name].md` file that captures the description, proposed approach, and a checklist ([]/[x]) with pause points for tests, analysis, or commits.
 - Create a task file only for work that changes project code; requests without execution (questions, clarifications, commit preparation) do not require a separate file unless explicitly asked by the user.
-- Execute the work step by step: after each step, stop for review and resume only when asked to continue; mark progress in the checklist.
+- Execute the work step by sxtep: after each step, stop for review and resume only when asked to continue; mark progress in the checklist.
 - When goals or input data change, update the plan and wait for confirmation before proceeding.
 
 ## Priority 3. Code and Tests
@@ -32,5 +32,20 @@ Project usage documentation and guidance are described in README.md. Follow it, 
 
 ## Priority 5. Commit Documentation
 
-- When requested, prepare the commit message in the format `full_branch_name.title` (EN) with a detailed `description` (RU); cover only staged files.
-- Save the resulting text in `./.git/COMMIT_EDITMSG`.
+## Commit Documentation Rules
+
+> Commit message format:
+>
+>
+> `full_branch_name`.`title` (eng)
+> `description` (ru)
+>
+
+Where:  
+
+- Commit documentation is prepared **without** a separate `.md` task file.  
+- `full_branch_name` — the full branch name, e.g., `feature/new_feature`, not just `new_feature`.  
+- `title` — a short English summary (3–7 words).  
+- `description` — a detailed explanation of the changes in Russian.  
+- Write documentation for **indexed files**, not already committed changes.  
+- The resulting text should be placed into `./.git/COMMIT_EDITMSG`.
