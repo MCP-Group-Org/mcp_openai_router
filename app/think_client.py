@@ -80,7 +80,18 @@ class ThinkCallResult:
 
 
 class ThinkToolClient:
-    """Минимальный JSON-RPC клиент для удалённого think-tool."""
+    """Минимальный JSON-RPC клиент для удалённого think-tool.
+
+    Поддерживает автоматическое восстановление сессии при рестарте think-сервиса:
+    - Обнаруживает устаревшую сессию по ответу 400 с маркерами "No valid session ID",
+      "Invalid or expired session" или "expired session ID"
+    - Автоматически выполняет повторный handshake (ping, initialize, notification)
+    - Повторяет неудачный запрос с новой сессией
+    - Ограничение: один retry на вызов для предотвращения бесконечных циклов
+
+    Механизм восстановления прозрачен для пользователя, но добавляет задержку
+    (~timeout + handshake) при первом запросе после рестарта think-сервиса.
+    """
 
     def __init__(self, config: ThinkToolConfig):
         if httpx is None:
@@ -149,11 +160,39 @@ class ThinkToolClient:
             "params": params,
         }
 
+        # Попытка отправки с автоматическим восстановлением сессии при необходимости
         try:
             logger.debug("capture_thought sending payload=%s", payload)
             response, status_code = self._post(payload, allow_error=False)
             logger.debug("capture_thought response status=%s body=%s", status_code, response)
-        except Exception as exc:  # pragma: no cover - проксируется в лог, в тестах отрабатываем моком
+        except RuntimeError as exc:
+            # Проверяем, является ли ошибка проблемой с устаревшей сессией
+            error_msg = str(exc)
+            if "[SESSION_ERROR]" in error_msg:
+                logger.info("Обнаружена устаревшая сессия think-tool, попытка автоматического восстановления")
+
+                # Сбрасываем состояние сессии
+                self._reset_session()
+
+                # Единственная попытка восстановления (max 1 retry)
+                try:
+                    # Повторная инициализация создаст новую сессию
+                    self._ensure_initialized()
+                    logger.info("Повторная попытка вызова think-tool после восстановления сессии: sessionId=%s", self._session_id)
+
+                    # Повторяем запрос с новой сессией
+                    response, status_code = self._post(payload, allow_error=False)
+                    logger.info("Автоматическое восстановление сессии успешно: новый sessionId=%s", self._session_id)
+                    logger.debug("capture_thought response after retry: status=%s body=%s", status_code, response)
+                except Exception as retry_exc:
+                    # Если повторная попытка тоже провалилась - возвращаем ошибку
+                    logger.warning("Автоматическое восстановление сессии не удалось: %s", retry_exc)
+                    return ThinkCallResult(ok=False, error=f"Не удалось восстановить сессию: {retry_exc}")
+            else:
+                # Другие RuntimeError (не связанные с сессией) - возвращаем как есть
+                logger.warning("Ошибка обращения к think-tool: %s", exc)
+                return ThinkCallResult(ok=False, error=error_msg)
+        except Exception as exc:  # pragma: no cover - сетевые и другие ошибки
             logger.warning("Ошибка обращения к think-tool: %s", exc)
             return ThinkCallResult(ok=False, error=str(exc))
 
@@ -175,6 +214,17 @@ class ThinkToolClient:
         )
 
     # --- внутренние методы ---
+
+    def _reset_session(self) -> None:
+        """Сбросить состояние сессии для повторной инициализации.
+
+        Вызывается при обнаружении устаревшей сессии (например, после рестарта think-сервиса).
+        Сбрасывает _session_id и _initialized, что приведет к повторному handshake
+        при следующем вызове _ensure_initialized().
+        """
+        logger.info("Сброс состояния сессии think-tool: старый sessionId=%s", self._session_id)
+        self._session_id = None
+        self._initialized = False
 
     def _ensure_initialized(self) -> None:
         if self._initialized:
@@ -261,7 +311,13 @@ class ThinkToolClient:
 
         for _ in range(attempts):
             try:
-                logger.debug("_post sending payload=%s headers=%s", payload, headers)
+                logger.debug(
+                    "_post request: url=%s sessionId=%s method=%s id=%s",
+                    self._config.url,
+                    self._session_id,
+                    payload.get("method"),
+                    payload.get("id"),
+                )
                 response = self._client.post(self._config.url, json=payload, headers=headers)
             except Exception as exc:  # pragma: no cover - реальный сетевой сбой
                 last_exc = exc
@@ -275,10 +331,26 @@ class ThinkToolClient:
 
             if not allow_error and response.status_code >= 400:
                 # Собираем тело для диагностики.
+                response_text = response.text
+                logger.warning(
+                    "think-tool вернул %s: sessionId=%s text=%s",
+                    response.status_code,
+                    self._session_id,
+                    response_text[:500],  # Ограничиваем длину для безопасности
+                )
+
+                # Проверяем, является ли ошибка проблемой с сессией
+                is_session_error = self._is_session_error(response_text)
+
                 parsed = self._parse_response(response)
                 detail = parsed.get("error") if isinstance(parsed, dict) else parsed
-                logger.debug("_post error status=%s parsed=%s", response.status_code, parsed)
-                raise RuntimeError(f"think-tool вернул {response.status_code}: {detail}")
+
+                # Добавляем маркер проблемы с сессией в исключение для обработки выше
+                error_msg = f"think-tool вернул {response.status_code}: {detail}"
+                if is_session_error:
+                    error_msg = f"[SESSION_ERROR] {error_msg}"
+
+                raise RuntimeError(error_msg)
 
             parsed = self._parse_response(response)
             logger.debug("_post parsed response=%s", parsed)
@@ -289,6 +361,27 @@ class ThinkToolClient:
             raise last_exc
 
         raise RuntimeError("Неизвестная ошибка think-tool (нет ответа).")
+
+    @staticmethod
+    def _is_session_error(response_text: str) -> bool:
+        """Проверить, является ли ошибка проблемой с устаревшей/невалидной сессией.
+
+        Проверяет специфичные маркеры FastMCP, указывающие на проблемы с session ID.
+        НЕ проверяет просто "Bad Request", так как это слишком общее и может вызвать
+        ложные срабатывания для других типов ошибок (невалидный JSON, неизвестный метод и т.д.).
+
+        Args:
+            response_text: Текст HTTP-ответа от think-tool сервера
+
+        Returns:
+            True если ошибка связана с сессией, False иначе
+        """
+        session_error_markers = [
+            "No valid session ID",  # "Bad Request: No valid session ID provided"
+            "Invalid or expired session",
+            "expired session ID",
+        ]
+        return any(marker in response_text for marker in session_error_markers)
 
     @staticmethod
     def _parse_response(response: "httpx.Response") -> Dict[str, Any]:
